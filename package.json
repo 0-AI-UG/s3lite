@@ -1,5 +1,5 @@
 {
-  "name": "s3lite",
+  "name": "@0-ai/s3lite",
   "version": "0.1.0",
   "description": "Embedded S3-compatible storage engine with WAL-based persistence. SQLite for object storage.",
   "type": "module",
