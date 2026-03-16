@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.s3db
+*.s3db-wal
+.DS_Store
