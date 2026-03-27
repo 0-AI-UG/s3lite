@@ -11,4 +11,6 @@ export type {
   S3ListObjectsOptions,
   S3ListObjectsResponse,
   StoredObject,
+  S3EventType,
+  S3EventCallback,
 } from "./types";

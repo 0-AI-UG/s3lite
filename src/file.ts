@@ -36,7 +36,7 @@ export class S3File extends Blob {
       return new Uint8Array(data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
     }
     const obj = this.store.get(this.bucket, this.name);
-    if (!obj) throw new Error(`S3File not found: ${this.bucket}/${this.name}`);
+    if (!obj || !obj.data) throw new Error(`S3File not found: ${this.bucket}/${this.name}`);
     return new Uint8Array(obj.data.buffer as ArrayBuffer, obj.data.byteOffset, obj.data.byteLength);
   }
 
@@ -111,7 +111,8 @@ export class S3File extends Blob {
     const bytes = await normalizeToBytes(data as Parameters<typeof normalizeToBytes>[0]);
     const contentType = options?.type ?? this.opts.type;
     const contentDisposition = options?.contentDisposition ?? this.opts.contentDisposition;
-    this.store.put(this.bucket, this.name, bytes, contentType, contentDisposition);
+    const expires = options?.expires ?? this.opts.expires;
+    this.store.put(this.bucket, this.name, bytes, contentType, contentDisposition, expires);
     return bytes.byteLength;
   }
 

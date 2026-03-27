@@ -138,7 +138,13 @@ function readRecords(data: Uint8Array, startOffset: number): ParsedRecord[] {
 
 function applyRecords(objects: ObjectMap, records: ParsedRecord[]): void {
   for (const rec of records) {
-    if (rec.op === WalOp.PUT && rec.objectData) {
+    if (rec.op === WalOp.PUT) {
+      const blobOffset = rec.metadata.blobOffset as number | undefined;
+      const blobLength = rec.metadata.blobLength as number | undefined;
+
+      // Need either inline data or a blob reference
+      if (!rec.objectData && blobOffset === undefined) continue;
+
       let bucketMap = objects.get(rec.bucket);
       if (!bucketMap) {
         bucketMap = new Map();
@@ -146,11 +152,14 @@ function applyRecords(objects: ObjectMap, records: ParsedRecord[]): void {
       }
       bucketMap.set(rec.key, {
         data: rec.objectData,
-        size: rec.objectData.byteLength,
+        size: rec.objectData?.byteLength ?? blobLength ?? 0,
         etag: (rec.metadata.etag as string) ?? "",
         contentType: (rec.metadata.contentType as string) ?? "application/octet-stream",
         lastModified: new Date((rec.metadata.lastModified as string) ?? Date.now()),
         contentDisposition: rec.metadata.contentDisposition as string | undefined,
+        expiresAt: rec.metadata.expiresAt as number | undefined,
+        blobOffset,
+        blobLength,
       });
     } else if (rec.op === WalOp.DELETE) {
       const bucketMap = objects.get(rec.bucket);
@@ -219,7 +228,7 @@ export class WAL {
   appendPut(
     bucket: string,
     key: string,
-    data: Uint8Array,
+    data: Uint8Array | null,
     metadata: Record<string, unknown>,
   ): void {
     const record = encodeRecord(WalOp.PUT, bucket, key, metadata, data);
@@ -237,7 +246,7 @@ export class WAL {
     return this.walSize >= this.checkpointThreshold;
   }
 
-  checkpoint(objects: ObjectMap): void {
+  checkpoint(objects: ObjectMap, blobBacked = false): void {
     const parts: Uint8Array[] = [];
 
     // Header
@@ -257,7 +266,20 @@ export class WAL {
         if (obj.contentDisposition) {
           metadata.contentDisposition = obj.contentDisposition;
         }
-        const record = encodeRecord(WalOp.PUT, bucket, key, metadata, obj.data);
+        if (obj.expiresAt) {
+          metadata.expiresAt = obj.expiresAt;
+        }
+
+        let data: Uint8Array | null;
+        if (blobBacked) {
+          metadata.blobOffset = obj.blobOffset;
+          metadata.blobLength = obj.blobLength;
+          data = null;
+        } else {
+          data = obj.data;
+        }
+
+        const record = encodeRecord(WalOp.PUT, bucket, key, metadata, data);
         parts.push(record);
       }
     }

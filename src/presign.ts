@@ -47,7 +47,16 @@ export class PresignHandler {
     return `${this.baseUrl}/${token}`;
   }
 
+  private pruneExpired(): void {
+    const now = Date.now();
+    for (const [token, entry] of this.tokens) {
+      if (now > entry.expires) this.tokens.delete(token);
+    }
+  }
+
   async handleRequest(req: Request): Promise<Response> {
+    this.pruneExpired();
+
     const url = new URL(req.url);
     const token = url.pathname.split("/").pop();
     if (!token) {
@@ -89,17 +98,42 @@ export class PresignHandler {
         });
       }
 
-      const data = await file.arrayBuffer();
+      const data = await file.bytes();
       const stat = await file.stat();
       const headers: Record<string, string> = {
         ...this.corsHeaders,
         "Content-Type": stat.type,
-        "Content-Length": String(stat.size),
         ETag: stat.etag,
+        "Accept-Ranges": "bytes",
       };
       if (entry.contentDisposition) {
         headers["Content-Disposition"] = entry.contentDisposition;
       }
+
+      const rangeHeader = req.headers.get("Range");
+      if (rangeHeader) {
+        const match = rangeHeader.match(/^bytes=(\d+)-(\d*)$/);
+        if (match) {
+          const start = parseInt(match[1], 10);
+          const end = match[2] ? parseInt(match[2], 10) : data.byteLength - 1;
+          const clampedEnd = Math.min(end, data.byteLength - 1);
+          if (start > clampedEnd || start >= data.byteLength) {
+            return new Response("Range Not Satisfiable", {
+              status: 416,
+              headers: {
+                ...this.corsHeaders,
+                "Content-Range": `bytes */${data.byteLength}`,
+              },
+            });
+          }
+          const slice = data.slice(start, clampedEnd + 1);
+          headers["Content-Range"] = `bytes ${start}-${clampedEnd}/${data.byteLength}`;
+          headers["Content-Length"] = String(slice.byteLength);
+          return new Response(slice, { status: 206, headers });
+        }
+      }
+
+      headers["Content-Length"] = String(stat.size);
       return new Response(data, { headers });
     }
 

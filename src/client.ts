@@ -4,6 +4,8 @@ import type {
   S3Stats,
   S3ListObjectsOptions,
   S3ListObjectsResponse,
+  S3EventType,
+  S3EventCallback,
 } from "./types";
 import { Store } from "./store";
 import { S3File } from "./file";
@@ -74,6 +76,24 @@ export class S3Client {
   ): Promise<S3ListObjectsResponse> {
     const bucket = options?.bucket ?? this.defaultBucket;
     return this.store.list(bucket, input ?? undefined);
+  }
+
+  async copy(
+    srcPath: string,
+    destPath: string,
+    options?: S3Options & { srcBucket?: string; destBucket?: string },
+  ): Promise<boolean> {
+    const srcBucket = options?.srcBucket ?? options?.bucket ?? this.defaultBucket;
+    const destBucket = options?.destBucket ?? options?.bucket ?? this.defaultBucket;
+    return this.store.copy(srcBucket, srcPath, destBucket, destPath);
+  }
+
+  on(event: S3EventType, callback: S3EventCallback): void {
+    this.store.on(event, callback);
+  }
+
+  off(event: S3EventType, callback: S3EventCallback): void {
+    this.store.off(event, callback);
   }
 
   checkpoint(): void {

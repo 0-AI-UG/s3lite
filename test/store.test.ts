@@ -5,7 +5,7 @@ import { rmSync, existsSync } from "node:fs";
 const TEST_PATH = "/tmp/s3lite-store-test.s3db";
 
 function cleanup() {
-  for (const p of [TEST_PATH, TEST_PATH + "-wal"]) {
+  for (const p of [TEST_PATH, TEST_PATH + "-wal", TEST_PATH + "-blobs"]) {
     if (existsSync(p)) rmSync(p);
   }
 }
@@ -20,7 +20,7 @@ test("Store: in-memory put and get", () => {
 
   const obj = store.get("b", "key.txt");
   expect(obj).toBeDefined();
-  expect(new TextDecoder().decode(obj!.data)).toBe("hello");
+  expect(new TextDecoder().decode(obj!.data!)).toBe("hello");
   expect(obj!.contentType).toBe("text/plain");
   expect(obj!.etag).toMatch(/^"[a-f0-9]+"$/);
 });
@@ -116,7 +116,7 @@ test("Store: persistence across close/reopen", () => {
   const store2 = new Store(TEST_PATH);
   const obj = store2.get("b", "persist.txt");
   expect(obj).toBeDefined();
-  expect(new TextDecoder().decode(obj!.data)).toBe("persistent");
+  expect(new TextDecoder().decode(obj!.data!)).toBe("persistent");
   store2.close();
 });
 

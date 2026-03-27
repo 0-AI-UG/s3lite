@@ -8,7 +8,7 @@ let client: S3Client | null = null;
 function cleanup() {
   client?.close();
   client = null;
-  for (const p of [TEST_PATH, TEST_PATH + "-wal"]) {
+  for (const p of [TEST_PATH, TEST_PATH + "-wal", TEST_PATH + "-blobs"]) {
     if (existsSync(p)) rmSync(p);
   }
 }

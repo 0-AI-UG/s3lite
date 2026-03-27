@@ -2,4 +2,6 @@ node_modules/
 dist/
 *.s3db
 *.s3db-wal
+*.s3db-blobs
+*.s3db-blobs.compact
 .DS_Store

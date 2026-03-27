@@ -12,7 +12,7 @@ test("NetworkSink: write chunks and end", async () => {
 
   expect(bytes).toBe(11);
   const obj = store.get("b", "sink.txt");
-  expect(new TextDecoder().decode(obj!.data)).toBe("hello world");
+  expect(new TextDecoder().decode(obj!.data!)).toBe("hello world");
 });
 
 test("NetworkSink: write Uint8Array", async () => {

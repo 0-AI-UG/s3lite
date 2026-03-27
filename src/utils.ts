@@ -38,9 +38,8 @@ export function guessMimeType(filename: string): string {
 }
 
 export function computeETag(data: Uint8Array): string {
-  const hasher = new Bun.CryptoHasher("md5");
-  hasher.update(data);
-  return `"${hasher.digest("hex")}"`;
+  const { createHash } = require("node:crypto");
+  return `"${createHash("md5").update(data).digest("hex")}"`;
 }
 
 export async function normalizeToBytes(

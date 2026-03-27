@@ -1,10 +1,13 @@
 export interface StoredObject {
-  data: Uint8Array;
+  data: Uint8Array | null;
   size: number;
   etag: string;
   contentType: string;
   lastModified: Date;
   contentDisposition?: string;
+  expiresAt?: number;
+  blobOffset?: number;
+  blobLength?: number;
 }
 
 export interface S3Options {
@@ -26,6 +29,8 @@ export interface S3Options {
   virtualHostedStyle?: boolean;
   /** Path to the .s3db file on disk. If omitted, pure in-memory. */
   path?: string;
+  /** TTL in seconds. Object auto-expires after this duration. */
+  expires?: number;
 }
 
 export interface S3FilePresignOptions extends S3Options {
@@ -77,3 +82,6 @@ export const enum WalOp {
 
 export const MAGIC = new Uint8Array([0x53, 0x33, 0x4c, 0x54]); // "S3LT"
 export const FORMAT_VERSION = 1;
+
+export type S3EventType = "put" | "delete" | "copy";
+export type S3EventCallback = (bucket: string, key: string) => void;

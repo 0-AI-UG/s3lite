@@ -53,7 +53,7 @@ test("WAL: append and replay PUT", () => {
 
   expect(objects2.has("mybucket")).toBe(true);
   const obj = objects2.get("mybucket")!.get("test.txt")!;
-  expect(new TextDecoder().decode(obj.data)).toBe("hello world");
+  expect(new TextDecoder().decode(obj.data!)).toBe("hello world");
   expect(obj.contentType).toBe("text/plain");
   wal2.close(objects2);
 });
@@ -151,6 +151,6 @@ test("WAL: crash recovery - uncommitted WAL entries are replayed", () => {
   wal2.open(objects2);
 
   expect(objects2.get("bucket")?.get("crash.txt")).toBeDefined();
-  expect(new TextDecoder().decode(objects2.get("bucket")!.get("crash.txt")!.data)).toBe("crash test data");
+  expect(new TextDecoder().decode(objects2.get("bucket")!.get("crash.txt")!.data!)).toBe("crash test data");
   wal2.close(objects2);
 });
