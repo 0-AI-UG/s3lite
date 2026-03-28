@@ -57,8 +57,7 @@ export class S3File extends Blob {
     return new TextDecoder().decode(this.getData());
   }
 
-  // json() is not on Blob base, so no override
-  async json(): Promise<unknown> {
+  override async json(): Promise<unknown> {
     const text = await this.text();
     return JSON.parse(text);
   }

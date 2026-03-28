@@ -184,7 +184,7 @@ export class Store {
   exists(bucket: string, key: string): boolean {
     const obj = this.objects.get(bucket)?.get(key);
     if (!obj) return false;
-    if (this.isExpired(obj)) {
+    if (this.isExpired(obj!)) {
       this.delete(bucket, key);
       return false;
     }
