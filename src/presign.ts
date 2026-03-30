@@ -13,18 +13,21 @@ interface TokenEntry {
 export interface PresignHandlerOptions {
   baseUrl: string;
   corsHeaders?: Record<string, string>;
+  maxTokens?: number;
 }
 
 export class PresignHandler {
   private client: S3Client;
   private baseUrl: string;
   private corsHeaders: Record<string, string>;
+  private maxTokens: number;
   private tokens = new Map<string, TokenEntry>();
 
   constructor(client: S3Client, options: PresignHandlerOptions) {
     this.client = client;
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.corsHeaders = options.corsHeaders ?? {};
+    this.maxTokens = options.maxTokens ?? 10000;
   }
 
   presign(
@@ -44,7 +47,23 @@ export class PresignHandler {
       contentDisposition: options?.contentDisposition,
     });
 
+    if (this.tokens.size > this.maxTokens) {
+      this.pruneExpired();
+      if (this.tokens.size > this.maxTokens) {
+        this.evictOldest(this.tokens.size - this.maxTokens);
+      }
+    }
+
     return `${this.baseUrl}/${token}`;
+  }
+
+  private evictOldest(count: number): void {
+    const entries = [...this.tokens.entries()].sort(
+      (a, b) => a[1].expires - b[1].expires,
+    );
+    for (let i = 0; i < count && i < entries.length; i++) {
+      this.tokens.delete(entries[i]![0]);
+    }
   }
 
   private pruneExpired(): void {
@@ -91,7 +110,7 @@ export class PresignHandler {
 
     if (req.method === "GET") {
       const file = this.client.file(entry.key, { bucket: entry.bucket });
-      if (!(await file.exists())) {
+      if (!file.exists()) {
         return new Response("Not Found", {
           status: 404,
           headers: this.corsHeaders,
@@ -99,7 +118,7 @@ export class PresignHandler {
       }
 
       const data = await file.bytes();
-      const stat = await file.stat();
+      const stat = file.stat();
       const headers: Record<string, string> = {
         ...this.corsHeaders,
         "Content-Type": stat.type,

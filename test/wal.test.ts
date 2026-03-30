@@ -97,7 +97,7 @@ test("WAL: append and replay DELETE", () => {
 
 test("WAL: checkpoint compacts main file", () => {
   const objects = new Map<string, Map<string, StoredObject>>();
-  const wal = new WAL(TEST_PATH, 1); // threshold of 1 byte to force checkpoint
+  const wal = new WAL(TEST_PATH, "off", 1); // threshold of 1 byte to force checkpoint
 
   wal.open(objects);
 

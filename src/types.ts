@@ -31,6 +31,10 @@ export interface S3Options {
   path?: string;
   /** TTL in seconds. Object auto-expires after this duration. */
   expires?: number;
+  /** Controls fsync behavior. "full" syncs every write, "normal" syncs at checkpoint, "off" never syncs (default: "normal") */
+  syncMode?: "full" | "normal" | "off";
+  /** Index mode. "memory" loads all keys in RAM (fast, limited scale). "disk" uses sparse disk index (millions of keys, lower RAM). Default: "memory" */
+  indexMode?: "memory" | "disk";
 }
 
 export interface S3FilePresignOptions extends S3Options {
@@ -78,6 +82,8 @@ export interface S3ListObjectsResponse {
 export const enum WalOp {
   PUT = 1,
   DELETE = 2,
+  TXN_BEGIN = 3,
+  TXN_COMMIT = 4,
 }
 
 export const MAGIC = new Uint8Array([0x53, 0x33, 0x4c, 0x54]); // "S3LT"

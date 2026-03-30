@@ -1,12 +1,14 @@
-import { test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { BlobLog } from "../src/blob";
 import { Store } from "../src/store";
 import { S3Client } from "../src/client";
 import { rmSync, existsSync, statSync } from "node:fs";
 
 const TEST_PATH = "/tmp/s3lite-blob-test.s3db";
+const BLOB_UNIT_PATH = "/tmp/s3lite-bloblog-unit.blobs";
 
 function cleanup() {
-  for (const p of [TEST_PATH, TEST_PATH + "-wal", TEST_PATH + "-blobs", TEST_PATH + "-blobs.compact"]) {
+  for (const p of [TEST_PATH, TEST_PATH + "-wal", TEST_PATH + "-blobs", TEST_PATH + "-blobs.compact", BLOB_UNIT_PATH, BLOB_UNIT_PATH + ".compact"]) {
     if (existsSync(p)) rmSync(p);
   }
 }
@@ -186,4 +188,199 @@ test("blob: multiple buckets on disk", () => {
   expect(new TextDecoder().decode(store2.get("bucket-a", "file.txt")!.data!)).toBe("data a");
   expect(new TextDecoder().decode(store2.get("bucket-b", "file.txt")!.data!)).toBe("data b");
   store2.close();
+});
+
+// ── BlobLog unit tests ──────────────────────────────────────────────
+
+describe("BlobLog unit", () => {
+  test("append returns correct offset and length", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const d1 = new TextEncoder().encode("hello");
+    const d2 = new TextEncoder().encode("world!");
+
+    const r1 = blob.append(d1);
+    expect(r1.offset).toBe(0);
+    expect(r1.length).toBe(5);
+
+    const r2 = blob.append(d2);
+    expect(r2.offset).toBe(5);
+    expect(r2.length).toBe(6);
+    blob.close();
+  });
+
+  test("read round-trips appended data", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const data = new TextEncoder().encode("test data here");
+    const { offset, length } = blob.append(data);
+
+    const result = blob.read(offset, length);
+    expect(new TextDecoder().decode(result)).toBe("test data here");
+    blob.close();
+  });
+
+  test("multiple appends read in any order", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const entries: { offset: number; length: number; text: string }[] = [];
+
+    for (let i = 0; i < 10; i++) {
+      const text = `entry-${i}`;
+      const data = new TextEncoder().encode(text);
+      const { offset, length } = blob.append(data);
+      entries.push({ offset, length, text });
+    }
+
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i]!;
+      const result = blob.read(e.offset, e.length);
+      expect(new TextDecoder().decode(result)).toBe(e.text);
+    }
+    blob.close();
+  });
+
+  test("readRange returns correct slice", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const data = new TextEncoder().encode("abcdefghij");
+    const { offset } = blob.append(data);
+
+    const slice = blob.readRange(offset, 10, 2, 5);
+    expect(new TextDecoder().decode(slice)).toBe("cde");
+    blob.close();
+  });
+
+  test("readRange clamps to blob length", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const data = new TextEncoder().encode("short");
+    const { offset } = blob.append(data);
+
+    const slice = blob.readRange(offset, 5, 2, 100);
+    expect(new TextDecoder().decode(slice)).toBe("ort");
+    blob.close();
+  });
+
+  test("readRange returns empty for zero-length or inverted range", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const data = new TextEncoder().encode("data");
+    const { offset } = blob.append(data);
+
+    expect(blob.readRange(offset, 4, 3, 3).byteLength).toBe(0);
+    expect(blob.readRange(offset, 4, 5, 2).byteLength).toBe(0);
+    blob.close();
+  });
+
+  test("markDead and shouldCompact threshold", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    blob.append(new TextEncoder().encode("x".repeat(100)));
+
+    expect(blob.shouldCompact()).toBe(false);
+    blob.markDead(40);
+    expect(blob.shouldCompact()).toBe(false);
+    blob.markDead(20);
+    expect(blob.shouldCompact()).toBe(true);
+    blob.close();
+  });
+
+  test("shouldCompact is false on empty log", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    blob.markDead(100);
+    expect(blob.shouldCompact()).toBe(false);
+    blob.close();
+  });
+
+  test("compact remaps offsets and shrinks file", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const r1 = blob.append(new TextEncoder().encode("AAAA"));
+    const r2 = blob.append(new TextEncoder().encode("BBBB"));
+    const r3 = blob.append(new TextEncoder().encode("CCCC"));
+
+    blob.markDead(r2.length);
+
+    const offsetMap = blob.compact([
+      { oldOffset: r1.offset, length: r1.length },
+      { oldOffset: r3.offset, length: r3.length },
+    ]);
+
+    expect(offsetMap.get(r1.offset)).toBe(0);
+    expect(offsetMap.get(r3.offset)).toBe(4);
+
+    expect(new TextDecoder().decode(blob.read(0, 4))).toBe("AAAA");
+    expect(new TextDecoder().decode(blob.read(4, 4))).toBe("CCCC");
+    expect(statSync(BLOB_UNIT_PATH).size).toBe(8);
+    blob.close();
+  });
+
+  test("compact with no live entries empties the file", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    blob.append(new TextEncoder().encode("dead"));
+    blob.markDead(4);
+
+    const offsetMap = blob.compact([]);
+    expect(offsetMap.size).toBe(0);
+    expect(statSync(BLOB_UNIT_PATH).size).toBe(0);
+    blob.close();
+  });
+
+  test("compact resets dead bytes", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const r1 = blob.append(new TextEncoder().encode("li"));
+    blob.append(new TextEncoder().encode("deaddd"));
+    blob.markDead(6);
+
+    // 6 dead out of 8 total = 75% > 50%
+    expect(blob.shouldCompact()).toBe(true);
+    blob.compact([{ oldOffset: r1.offset, length: r1.length }]);
+    expect(blob.shouldCompact()).toBe(false);
+    blob.close();
+  });
+
+  test("append after compact starts at correct offset", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const r1 = blob.append(new TextEncoder().encode("keep"));
+    blob.append(new TextEncoder().encode("remove"));
+    blob.markDead(6);
+
+    blob.compact([{ oldOffset: r1.offset, length: r1.length }]);
+
+    const r3 = blob.append(new TextEncoder().encode("new!"));
+    expect(r3.offset).toBe(4);
+    expect(new TextDecoder().decode(blob.read(r3.offset, r3.length))).toBe("new!");
+    blob.close();
+  });
+
+  test("reopening preserves data and resumes offset", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const { offset, length } = blob.append(new TextEncoder().encode("persistent"));
+    blob.close();
+
+    const blob2 = new BlobLog(BLOB_UNIT_PATH, "off");
+    expect(new TextDecoder().decode(blob2.read(offset, length))).toBe("persistent");
+
+    const r2 = blob2.append(new TextEncoder().encode("more"));
+    expect(r2.offset).toBe(10);
+    blob2.close();
+  });
+
+  test("binary data round-trips", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const data = new Uint8Array([0, 1, 2, 255, 254, 128, 0, 0]);
+    const { offset, length } = blob.append(data);
+
+    expect(blob.read(offset, length)).toEqual(data);
+    blob.close();
+  });
+
+  test("single-byte operations", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "off");
+    const r = blob.append(new Uint8Array([42]));
+    expect(r.length).toBe(1);
+    expect(blob.read(0, 1)[0]).toBe(42);
+    expect(blob.readRange(0, 1, 0, 1)[0]).toBe(42);
+    blob.close();
+  });
+
+  test("syncMode full does not error", () => {
+    const blob = new BlobLog(BLOB_UNIT_PATH, "full");
+    const { offset, length } = blob.append(new TextEncoder().encode("synced"));
+    expect(new TextDecoder().decode(blob.read(offset, length))).toBe("synced");
+    blob.close();
+  });
 });

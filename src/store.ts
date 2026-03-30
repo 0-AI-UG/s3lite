@@ -1,3 +1,4 @@
+import { copyFileSync, existsSync } from "node:fs";
 import type {
   StoredObject,
   S3ListObjectsOptions,
@@ -6,21 +7,122 @@ import type {
   S3EventType,
   S3EventCallback,
 } from "./types";
-import { WAL } from "./wal";
+import { WAL, type IntegrityReport } from "./wal";
 import { BlobLog } from "./blob";
+import { FileLock } from "./lock";
+import { DiskIndex } from "./disk-index";
 import { computeETag, guessMimeType } from "./utils";
+
+type SyncMode = "full" | "normal" | "off";
+type IndexMode = "memory" | "disk";
+
+interface TxnPutOp {
+  type: "put";
+  bucket: string;
+  key: string;
+  data: Uint8Array;
+  contentType?: string;
+  contentDisposition?: string;
+  expires?: number;
+}
+
+interface TxnDeleteOp {
+  type: "delete";
+  bucket: string;
+  key: string;
+}
+
+type TxnOp = TxnPutOp | TxnDeleteOp;
+
+export class TransactionContext {
+  /** @internal */
+  _ops: TxnOp[] = [];
+
+  put(
+    bucket: string,
+    key: string,
+    data: Uint8Array,
+    contentType?: string,
+    contentDisposition?: string,
+    expires?: number,
+  ): void {
+    this._ops.push({ type: "put", bucket, key, data, contentType, contentDisposition, expires });
+  }
+
+  delete(bucket: string, key: string): void {
+    this._ops.push({ type: "delete", bucket, key });
+  }
+}
 
 export class Store {
   private objects: Map<string, Map<string, StoredObject>> = new Map();
+  private diskIdx: DiskIndex | null = null;
   private wal: WAL | null = null;
   private blobLog: BlobLog | null = null;
+  private lock: FileLock | null = null;
+  private mainPath: string | null = null;
   private listeners: Map<S3EventType, Set<S3EventCallback>> = new Map();
+  private inTransaction = false;
+  private pendingEvents: Array<[S3EventType, string, string]> = [];
 
-  constructor(path?: string) {
+  constructor(path?: string, syncMode: SyncMode = "normal", indexMode: IndexMode = "memory") {
     if (path) {
-      this.wal = new WAL(path);
-      this.blobLog = new BlobLog(path + "-blobs");
-      this.wal.open(this.objects);
+      this.mainPath = path;
+      this.lock = new FileLock(path);
+      this.lock.acquire();
+      this.wal = new WAL(path, syncMode);
+      this.blobLog = new BlobLog(path + "-blobs", syncMode);
+
+      if (indexMode === "disk") {
+        this.diskIdx = new DiskIndex(path);
+        this.diskIdx.open();
+        this.wal.openWithDiskIndex(this.diskIdx);
+      } else {
+        this.wal.open(this.objects);
+      }
+    }
+  }
+
+  // --- Index abstraction layer ---
+
+  private indexGet(bucket: string, key: string): StoredObject | undefined {
+    if (this.diskIdx) return this.diskIdx.get(bucket, key);
+    return this.objects.get(bucket)?.get(key);
+  }
+
+  private indexSet(bucket: string, key: string, obj: StoredObject): void {
+    if (this.diskIdx) {
+      this.diskIdx.set(bucket, key, obj);
+    } else {
+      let bucketMap = this.objects.get(bucket);
+      if (!bucketMap) {
+        bucketMap = new Map();
+        this.objects.set(bucket, bucketMap);
+      }
+      bucketMap.set(key, obj);
+    }
+  }
+
+  private indexDelete(bucket: string, key: string): boolean {
+    if (this.diskIdx) return this.diskIdx.delete(bucket, key);
+    const bucketMap = this.objects.get(bucket);
+    if (!bucketMap) return false;
+    const existed = bucketMap.delete(key);
+    if (existed && bucketMap.size === 0) this.objects.delete(bucket);
+    return existed;
+  }
+
+  private indexHas(bucket: string, key: string): boolean {
+    if (this.diskIdx) return this.diskIdx.has(bucket, key);
+    return this.objects.get(bucket)?.has(key) ?? false;
+  }
+
+  private *sortedBucketEntries(bucket: string): IterableIterator<[string, StoredObject]> {
+    const bucketMap = this.objects.get(bucket);
+    if (!bucketMap) return;
+    const keys = [...bucketMap.keys()].sort();
+    for (const key of keys) {
+      yield [key, bucketMap.get(key)!];
     }
   }
 
@@ -38,10 +140,24 @@ export class Store {
   }
 
   private emit(event: S3EventType, bucket: string, key: string): void {
+    if (this.inTransaction) {
+      this.pendingEvents.push([event, bucket, key]);
+      return;
+    }
     const set = this.listeners.get(event);
     if (set) {
       for (const cb of set) cb(bucket, key);
     }
+  }
+
+  private flushEvents(): void {
+    for (const [event, bucket, key] of this.pendingEvents) {
+      const set = this.listeners.get(event);
+      if (set) {
+        for (const cb of set) cb(bucket, key);
+      }
+    }
+    this.pendingEvents = [];
   }
 
   put(
@@ -59,7 +175,7 @@ export class Store {
 
     if (this.blobLog) {
       // Mark old blob data as dead if overwriting
-      const existing = this.objects.get(bucket)?.get(key);
+      const existing = this.indexGet(bucket, key);
       if (existing?.blobLength) this.blobLog.markDead(existing.blobLength);
 
       const { offset, length } = this.blobLog.append(data);
@@ -74,47 +190,33 @@ export class Store {
       if (expiresAt) metadata.expiresAt = expiresAt;
 
       this.wal!.appendPut(bucket, key, null, metadata);
-      this.setInMap(bucket, key, null, resolvedType, etag, lastModified, contentDisposition, expiresAt, offset, length);
+      this.indexSet(bucket, key, {
+        data: null, size: length, etag, contentType: resolvedType,
+        lastModified, contentDisposition, expiresAt, blobOffset: offset, blobLength: length,
+      });
 
-      if (this.wal!.shouldCheckpoint() || this.blobLog.shouldCompact()) {
-        this.compactAndCheckpoint();
+      if (!this.inTransaction) {
+        if (this.blobLog.shouldCompact()) {
+          this.compactAndCheckpoint();
+        } else if (this.wal!.shouldCheckpoint()) {
+          if (this.diskIdx) {
+            // Disk index requires sorted main file; do full checkpoint
+            this.wal!.checkpointFromIterator(this.diskIdx.entries(), true);
+            this.diskIdx.reopen();
+          } else {
+            this.wal!.incrementalCheckpoint();
+          }
+        }
       }
     } else {
       // In-memory mode
-      this.setInMap(bucket, key, data, resolvedType, etag, lastModified, contentDisposition, expiresAt);
+      this.indexSet(bucket, key, {
+        data, size: data.byteLength, etag, contentType: resolvedType,
+        lastModified, contentDisposition, expiresAt,
+      });
     }
 
     this.emit("put", bucket, key);
-  }
-
-  private setInMap(
-    bucket: string,
-    key: string,
-    data: Uint8Array | null,
-    contentType: string,
-    etag: string,
-    lastModified: Date,
-    contentDisposition?: string,
-    expiresAt?: number,
-    blobOffset?: number,
-    blobLength?: number,
-  ): void {
-    let bucketMap = this.objects.get(bucket);
-    if (!bucketMap) {
-      bucketMap = new Map();
-      this.objects.set(bucket, bucketMap);
-    }
-    bucketMap.set(key, {
-      data,
-      size: blobLength ?? data?.byteLength ?? 0,
-      etag,
-      contentType,
-      lastModified,
-      contentDisposition,
-      expiresAt,
-      blobOffset,
-      blobLength,
-    });
   }
 
   private isExpired(obj: StoredObject): boolean {
@@ -122,7 +224,7 @@ export class Store {
   }
 
   private getObject(bucket: string, key: string): StoredObject | undefined {
-    const obj = this.objects.get(bucket)?.get(key);
+    const obj = this.indexGet(bucket, key);
     if (!obj) return undefined;
     if (this.isExpired(obj)) {
       this.delete(bucket, key);
@@ -166,25 +268,23 @@ export class Store {
   }
 
   delete(bucket: string, key: string): boolean {
-    const bucketMap = this.objects.get(bucket);
-    if (!bucketMap) return false;
-    const obj = bucketMap.get(key);
-    const existed = bucketMap.delete(key);
+    const obj = this.indexGet(bucket, key);
+    if (!obj) return false;
+    const existed = this.indexDelete(bucket, key);
     if (existed) {
-      if (this.blobLog && obj?.blobLength) {
+      if (this.blobLog && obj.blobLength) {
         this.blobLog.markDead(obj.blobLength);
       }
       if (this.wal) this.wal.appendDelete(bucket, key);
-      if (bucketMap.size === 0) this.objects.delete(bucket);
       this.emit("delete", bucket, key);
     }
     return existed;
   }
 
   exists(bucket: string, key: string): boolean {
-    const obj = this.objects.get(bucket)?.get(key);
+    const obj = this.indexGet(bucket, key);
     if (!obj) return false;
-    if (this.isExpired(obj!)) {
+    if (this.isExpired(obj)) {
       this.delete(bucket, key);
       return false;
     }
@@ -212,13 +312,14 @@ export class Store {
     if (!obj) return false;
 
     const data = this.loadData(obj);
+    const now = new Date();
 
     if (this.blobLog) {
       const { offset, length } = this.blobLog.append(data);
       const metadata: Record<string, unknown> = {
         contentType: obj.contentType,
         etag: obj.etag,
-        lastModified: new Date().toISOString(),
+        lastModified: now.toISOString(),
         blobOffset: offset,
         blobLength: length,
       };
@@ -226,12 +327,20 @@ export class Store {
       if (obj.expiresAt) metadata.expiresAt = obj.expiresAt;
 
       this.wal!.appendPut(destBucket, destKey, null, metadata);
-      this.setInMap(destBucket, destKey, null, obj.contentType, obj.etag, new Date(), obj.contentDisposition, obj.expiresAt, offset, length);
+      this.indexSet(destBucket, destKey, {
+        data: null, size: length, etag: obj.etag, contentType: obj.contentType,
+        lastModified: now, contentDisposition: obj.contentDisposition,
+        expiresAt: obj.expiresAt, blobOffset: offset, blobLength: length,
+      });
     } else {
-      this.setInMap(destBucket, destKey, data.slice(), obj.contentType, obj.etag, new Date(), obj.contentDisposition, obj.expiresAt);
+      this.indexSet(destBucket, destKey, {
+        data: data.slice(), size: data.byteLength, etag: obj.etag,
+        contentType: obj.contentType, lastModified: now,
+        contentDisposition: obj.contentDisposition, expiresAt: obj.expiresAt,
+      });
     }
 
-    this.emit("copy", srcBucket, srcKey);
+    this.emit("copy", destBucket, destKey);
     return true;
   }
 
@@ -242,74 +351,71 @@ export class Store {
     const prefix = opts?.prefix ?? "";
     const delimiter = opts?.delimiter;
     const maxKeys = opts?.maxKeys ?? 1000;
-    const startAfter = opts?.startAfter;
+    const effectiveStartAfter = opts?.continuationToken ?? opts?.startAfter;
 
-    const bucketMap = this.objects.get(bucket);
-    const allKeys: string[] = [];
-
-    if (bucketMap) {
-      for (const [key, obj] of bucketMap) {
-        if (key.startsWith(prefix)) {
-          if (this.isExpired(obj)) {
-            this.delete(bucket, key);
-            continue;
-          }
-          allKeys.push(key);
-        }
-      }
-    }
-
-    allKeys.sort();
-
-    // Filter by startAfter
-    let filteredKeys = startAfter
-      ? allKeys.filter((k) => k > startAfter)
-      : allKeys;
-
+    // Iterate entries — disk index yields sorted, in-memory needs sorting
     const commonPrefixSet = new Set<string>();
-    const contents: S3ListObjectsResponse["contents"] = [];
+    const contents: NonNullable<S3ListObjectsResponse["contents"]> = [];
+    let itemCount = 0;
+    let isTruncated = false;
 
-    for (const key of filteredKeys) {
+    const iterate = this.diskIdx
+      ? this.diskIdx.bucketEntries(bucket)
+      : this.sortedBucketEntries(bucket);
+
+    for (const [key, obj] of iterate) {
+      if (!key.startsWith(prefix)) continue;
+      if (this.isExpired(obj)) {
+        this.delete(bucket, key);
+        continue;
+      }
+      if (effectiveStartAfter && key <= effectiveStartAfter) continue;
+
+      if (itemCount >= maxKeys) {
+        isTruncated = true;
+        break;
+      }
+
       if (delimiter) {
         const rest = key.slice(prefix.length);
         const delimIdx = rest.indexOf(delimiter);
         if (delimIdx !== -1) {
-          commonPrefixSet.add(prefix + rest.slice(0, delimIdx + delimiter.length));
+          const cp = prefix + rest.slice(0, delimIdx + delimiter.length);
+          if (!commonPrefixSet.has(cp)) {
+            commonPrefixSet.add(cp);
+            itemCount++;
+          }
           continue;
         }
       }
       contents.push({
         key,
-        eTag: bucketMap!.get(key)!.etag,
-        lastModified: bucketMap!.get(key)!.lastModified.toISOString(),
-        size: bucketMap!.get(key)!.size,
+        eTag: obj.etag,
+        lastModified: obj.lastModified.toISOString(),
+        size: obj.size,
       });
+      itemCount++;
     }
-
-    // Apply maxKeys to contents + commonPrefixes combined
-    const totalItems = contents.length + commonPrefixSet.size;
-    const isTruncated = totalItems > maxKeys;
-
-    // Truncate contents if needed
-    const truncatedContents = contents.slice(0, maxKeys);
 
     const commonPrefixes = [...commonPrefixSet]
       .sort()
       .map((p) => ({ prefix: p }));
 
     const response: S3ListObjectsResponse = {
-      contents: truncatedContents.length > 0 ? truncatedContents : undefined,
+      contents: contents.length > 0 ? contents : undefined,
       commonPrefixes: commonPrefixes.length > 0 ? commonPrefixes : undefined,
       isTruncated,
-      keyCount: truncatedContents.length,
+      keyCount: contents.length,
       maxKeys,
       prefix: prefix || undefined,
       delimiter,
       name: bucket,
+      continuationToken: opts?.continuationToken,
+      startAfter: opts?.startAfter,
     };
 
-    if (isTruncated && truncatedContents.length > 0) {
-      const lastKey = truncatedContents[truncatedContents.length - 1]!.key;
+    if (isTruncated && contents.length > 0) {
+      const lastKey = contents[contents.length - 1]!.key;
       response.nextContinuationToken = lastKey;
     }
 
@@ -319,43 +425,181 @@ export class Store {
   private compactAndCheckpoint(): void {
     if (!this.blobLog || !this.wal) return;
 
-    const liveEntries: { oldOffset: number; length: number }[] = [];
-    for (const [, bucketMap] of this.objects) {
-      for (const [, obj] of bucketMap) {
+    if (this.diskIdx) {
+      // Materialize all entries (disk reads are ephemeral, can't update in-place)
+      const allEntries: Array<[string, string, StoredObject]> = [...this.diskIdx.entries()];
+
+      const liveEntries: { oldOffset: number; length: number }[] = [];
+      for (const [, , obj] of allEntries) {
         if (obj.blobOffset !== undefined && obj.blobLength !== undefined) {
           liveEntries.push({ oldOffset: obj.blobOffset, length: obj.blobLength });
         }
       }
-    }
 
-    const offsetMap = this.blobLog.compact(liveEntries);
+      const offsetMap = this.blobLog.compact(liveEntries);
 
-    for (const [, bucketMap] of this.objects) {
-      for (const [, obj] of bucketMap) {
+      for (const [, , obj] of allEntries) {
         if (obj.blobOffset !== undefined) {
           const newOffset = offsetMap.get(obj.blobOffset);
           if (newOffset !== undefined) obj.blobOffset = newOffset;
         }
       }
+
+      this.wal.checkpointFromIterator(allEntries, true);
+      this.diskIdx.reopen();
+    } else {
+      const liveEntries: { oldOffset: number; length: number }[] = [];
+      for (const [, bucketMap] of this.objects) {
+        for (const [, obj] of bucketMap) {
+          if (obj.blobOffset !== undefined && obj.blobLength !== undefined) {
+            liveEntries.push({ oldOffset: obj.blobOffset, length: obj.blobLength });
+          }
+        }
+      }
+
+      const offsetMap = this.blobLog.compact(liveEntries);
+
+      for (const [, bucketMap] of this.objects) {
+        for (const [, obj] of bucketMap) {
+          if (obj.blobOffset !== undefined) {
+            const newOffset = offsetMap.get(obj.blobOffset);
+            if (newOffset !== undefined) obj.blobOffset = newOffset;
+          }
+        }
+      }
+
+      this.wal.checkpoint(this.objects, true);
+    }
+  }
+
+  transaction(fn: (txn: TransactionContext) => void): void {
+    if (this.inTransaction) throw new Error("Nested transactions are not supported");
+
+    const txn = new TransactionContext();
+    fn(txn);
+
+    if (txn._ops.length === 0) return;
+
+    this.inTransaction = true;
+
+    if (this.wal) {
+      this.wal.appendTxnBegin();
     }
 
-    this.wal.checkpoint(this.objects, true);
+    // Snapshot affected keys for rollback
+    const snapshots = new Map<string, StoredObject | undefined>();
+    for (const op of txn._ops) {
+      const snapKey = op.bucket + "\0" + op.key;
+      if (!snapshots.has(snapKey)) {
+        const existing = this.indexGet(op.bucket, op.key);
+        snapshots.set(snapKey, existing ? { ...existing, data: existing.data?.slice() ?? null } : undefined);
+      }
+    }
+
+    try {
+      for (const op of txn._ops) {
+        if (op.type === "put") {
+          this.put(op.bucket, op.key, op.data, op.contentType, op.contentDisposition, op.expires);
+        } else {
+          this.delete(op.bucket, op.key);
+        }
+      }
+    } catch (err) {
+      this.inTransaction = false;
+      this.pendingEvents = [];
+      // Rollback using snapshots
+      for (const [snapKey, original] of snapshots) {
+        const [bucket, key] = snapKey.split("\0") as [string, string];
+        if (original) {
+          this.indexSet(bucket, key, original);
+        } else {
+          this.indexDelete(bucket, key);
+        }
+      }
+      if (this.wal) {
+        this.wal.truncateUncommitted();
+      }
+      throw err;
+    }
+
+    this.inTransaction = false;
+
+    if (this.wal) {
+      this.wal.appendTxnCommit();
+    }
+
+    this.flushEvents();
   }
 
   checkpoint(): void {
+    if (!this.wal) return;
+
     if (this.blobLog) {
+      // Blob compaction needs offset remapping — always full
       this.compactAndCheckpoint();
-    } else if (this.wal) {
+    } else if (this.diskIdx) {
+      // Disk index requires sorted main file — always full
+      this.wal.checkpointFromIterator(this.diskIdx.entries());
+      this.diskIdx.reopen();
+    } else if (this.wal.shouldFullCompact()) {
+      // Main file has too many stale entries from incremental appends — full rewrite
       this.wal.checkpoint(this.objects);
+    } else {
+      // Fast path: append WAL to main file
+      this.wal.incrementalCheckpoint();
+    }
+  }
+
+  /** Check integrity of the database files without modifying anything. */
+  integrityCheck(): IntegrityReport {
+    if (!this.wal) return { totalRecords: 0, validRecords: 0, corruptRecords: [], ok: true };
+    return this.wal.integrityCheck();
+  }
+
+  /** Repair corrupt records by skipping them and rewriting clean data. Returns report of what was found. */
+  repair(): IntegrityReport {
+    if (!this.wal) return { totalRecords: 0, validRecords: 0, corruptRecords: [], ok: true };
+    return this.wal.repair();
+  }
+
+  /** Create a consistent backup of the database at destPath. */
+  backup(destPath: string): void {
+    if (!this.wal) throw new Error("Cannot backup an in-memory store");
+
+    // Checkpoint to flush WAL into main file, producing a self-contained snapshot
+    this.checkpoint();
+
+    // Copy the main file
+    copyFileSync(this.mainPath!, destPath);
+
+    // Copy blob file if it exists
+    const blobPath = this.mainPath! + "-blobs";
+    if (existsSync(blobPath)) {
+      copyFileSync(blobPath, destPath + "-blobs");
     }
   }
 
   close(): void {
-    if (this.blobLog) {
-      this.compactAndCheckpoint();
-      this.blobLog.close();
-    } else if (this.wal) {
-      this.wal.close(this.objects);
+    if (this.diskIdx) {
+      if (this.blobLog) {
+        this.compactAndCheckpoint();
+        this.blobLog.close();
+      } else if (this.wal) {
+        this.wal.checkpointFromIterator(this.diskIdx.entries());
+        this.wal.closeFd();
+      }
+      this.diskIdx.close();
+    } else {
+      if (this.blobLog) {
+        this.compactAndCheckpoint();
+        this.blobLog.close();
+      } else if (this.wal) {
+        this.wal.close(this.objects);
+      }
+    }
+    if (this.lock) {
+      this.lock.release();
+      this.lock = null;
     }
   }
 }

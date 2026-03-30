@@ -7,7 +7,7 @@ import type {
   S3EventType,
   S3EventCallback,
 } from "./types";
-import { Store } from "./store";
+import { Store, TransactionContext } from "./store";
 import { S3File } from "./file";
 
 export class S3Client {
@@ -18,7 +18,7 @@ export class S3Client {
   constructor(options?: S3Options) {
     this.opts = options ?? {};
     this.defaultBucket = options?.bucket ?? "default";
-    this.store = new Store(options?.path);
+    this.store = new Store(options?.path, options?.syncMode, options?.indexMode);
   }
 
   file(path: string, options?: S3Options): S3File {
@@ -45,9 +45,9 @@ export class S3Client {
     return f.write(data, options);
   }
 
-  async delete(path: string, options?: S3Options): Promise<void> {
+  delete(path: string, options?: S3Options): void {
     const f = this.file(path, options);
-    return f.delete();
+    f.delete();
   }
 
   unlink = this.delete.bind(this);
@@ -57,32 +57,32 @@ export class S3Client {
     return f.presign(options);
   }
 
-  async size(path: string, options?: S3Options): Promise<number> {
-    const s = await this.file(path, options).stat();
+  size(path: string, options?: S3Options): number {
+    const s = this.file(path, options).stat();
     return s.size;
   }
 
-  async exists(path: string, options?: S3Options): Promise<boolean> {
+  exists(path: string, options?: S3Options): boolean {
     return this.file(path, options).exists();
   }
 
-  async stat(path: string, options?: S3Options): Promise<S3Stats> {
+  stat(path: string, options?: S3Options): S3Stats {
     return this.file(path, options).stat();
   }
 
-  async list(
+  list(
     input?: S3ListObjectsOptions | null,
     options?: S3Options,
-  ): Promise<S3ListObjectsResponse> {
+  ): S3ListObjectsResponse {
     const bucket = options?.bucket ?? this.defaultBucket;
     return this.store.list(bucket, input ?? undefined);
   }
 
-  async copy(
+  copy(
     srcPath: string,
     destPath: string,
     options?: S3Options & { srcBucket?: string; destBucket?: string },
-  ): Promise<boolean> {
+  ): boolean {
     const srcBucket = options?.srcBucket ?? options?.bucket ?? this.defaultBucket;
     const destBucket = options?.destBucket ?? options?.bucket ?? this.defaultBucket;
     return this.store.copy(srcBucket, srcPath, destBucket, destPath);
@@ -94,6 +94,10 @@ export class S3Client {
 
   off(event: S3EventType, callback: S3EventCallback): void {
     this.store.off(event, callback);
+  }
+
+  transaction(fn: (txn: TransactionContext) => void): void {
+    this.store.transaction(fn);
   }
 
   checkpoint(): void {

@@ -32,9 +32,9 @@ export class VectorStore {
   private wal: VectorWAL | null = null;
   private listeners: Map<VectorEventType, Set<VectorEventCallback>> = new Map();
 
-  constructor(path?: string) {
+  constructor(path?: string, syncMode: "full" | "normal" | "off" = "normal") {
     if (path) {
-      this.wal = new VectorWAL(path);
+      this.wal = new VectorWAL(path, syncMode);
       this.wal.open(this);
     }
   }
@@ -75,6 +75,11 @@ export class VectorStore {
     const hnsw = new HNSWIndex(config.dimension, config.distanceMetric, config.hnswConfig.M, config.hnswConfig.efConstruction);
     const sparseIdx = config.sparse ? new SparseIndex() : null;
     this.indexes.set(config.name, { config, hnsw, sparse: sparseIdx, vectors: new Map() });
+  }
+
+  // Internal: delete index without WAL (used during replay)
+  _deleteIndexInternal(name: string): void {
+    this.indexes.delete(name);
   }
 
   getIndex(name: string): VectorIndexConfig | undefined {
@@ -135,13 +140,20 @@ export class VectorStore {
   }
 
   // Internal: put vector without WAL (used during replay)
-  _putVectorInternal(indexName: string, key: string, vector: Float32Array | null, metadata?: Record<string, unknown>, sparseVector?: { indices: number[]; values: number[] }): void {
+  _putVectorInternal(indexName: string, key: string, vector: Float32Array | null, metadata?: Record<string, unknown>, sparseVector?: { indices: number[]; values: number[] }, skipHNSW = false): void {
     const entry = this.indexes.get(indexName);
     if (!entry) return;
 
     entry.vectors.set(key, { key, metadata, sparseVector });
-    if (vector) entry.hnsw.insert(key, vector, metadata);
+    if (vector && !skipHNSW) entry.hnsw.insert(key, vector, metadata);
     if (sparseVector && entry.sparse) entry.sparse.insert(key, sparseVector);
+  }
+
+  // Internal: replace the HNSW index for a given index entry (used after graph deserialization)
+  _setHNSW(indexName: string, hnsw: HNSWIndex): void {
+    const entry = this.indexes.get(indexName);
+    if (!entry) return;
+    entry.hnsw = hnsw;
   }
 
   getVectors(indexName: string, keys: string[]): GetVectorResponse[] {

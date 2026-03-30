@@ -1,3 +1,4 @@
+import { dirname } from "node:path";
 import {
   existsSync,
   openSync,
@@ -10,14 +11,18 @@ import {
 } from "node:fs";
 import { writeFileSync } from "node:fs";
 
+type SyncMode = "full" | "normal" | "off";
+
 export class BlobLog {
   private path: string;
   private fd: number;
   private currentSize: number;
   private deadBytes = 0;
+  private syncMode: SyncMode;
 
-  constructor(path: string) {
+  constructor(path: string, syncMode: SyncMode = "normal") {
     this.path = path;
+    this.syncMode = syncMode;
     const exists = existsSync(path);
     this.fd = openSync(path, exists ? "r+" : "w+");
     this.currentSize = exists ? fstatSync(this.fd).size : 0;
@@ -27,6 +32,9 @@ export class BlobLog {
     const offset = this.currentSize;
     writeSync(this.fd, data, 0, data.byteLength, offset);
     this.currentSize += data.byteLength;
+    if (this.syncMode === "full") {
+      fsyncSync(this.fd);
+    }
     return { offset, length: data.byteLength };
   }
 
@@ -86,6 +94,18 @@ export class BlobLog {
     closeSync(newFd);
     closeSync(this.fd);
     renameSync(newPath, this.path);
+
+    // Ensure rename is durable
+    if (this.syncMode !== "off") {
+      try {
+        const dirPath = dirname(this.path);
+        const dirFd = openSync(dirPath, "r");
+        fsyncSync(dirFd);
+        closeSync(dirFd);
+      } catch {
+        // Directory fsync may not be supported on all platforms
+      }
+    }
 
     this.fd = openSync(this.path, "r+");
     this.currentSize = newOffset;

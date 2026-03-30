@@ -38,7 +38,7 @@ test("events: copy fires on copy", async () => {
   await client.write("src.txt", "data");
   await client.copy("src.txt", "dest.txt");
 
-  expect(events).toEqual(["b/src.txt"]);
+  expect(events).toEqual(["b/dest.txt"]);
 });
 
 test("events: off removes listener", async () => {

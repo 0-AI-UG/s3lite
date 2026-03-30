@@ -37,8 +37,9 @@ export function guessMimeType(filename: string): string {
   return MIME_TYPES[ext] ?? "application/octet-stream";
 }
 
+import { createHash } from "node:crypto";
+
 export function computeETag(data: Uint8Array): string {
-  const { createHash } = require("node:crypto");
   return `"${createHash("md5").update(data).digest("hex")}"`;
 }
 

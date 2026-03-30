@@ -2,6 +2,55 @@ import type { DistanceMetric, HNSWNode, ScoredResult, MetadataFilter } from "./t
 import { computeNorm, getDistanceFn } from "./distance";
 import { matchesFilter } from "./filter";
 
+class BinaryHeap {
+  private items: ScoredResult[] = [];
+  constructor(private cmp: (a: ScoredResult, b: ScoredResult) => number) {}
+
+  get size(): number { return this.items.length; }
+
+  peek(): ScoredResult | undefined { return this.items[0]; }
+
+  push(item: ScoredResult): void {
+    this.items.push(item);
+    this.siftUp(this.items.length - 1);
+  }
+
+  pop(): ScoredResult | undefined {
+    if (this.items.length === 0) return undefined;
+    const top = this.items[0]!;
+    const last = this.items.pop()!;
+    if (this.items.length > 0) {
+      this.items[0] = last;
+      this.siftDown(0);
+    }
+    return top;
+  }
+
+  private siftUp(i: number): void {
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (this.cmp(this.items[i]!, this.items[parent]!) < 0) {
+        [this.items[i], this.items[parent]] = [this.items[parent]!, this.items[i]!];
+        i = parent;
+      } else break;
+    }
+  }
+
+  private siftDown(i: number): void {
+    const n = this.items.length;
+    while (true) {
+      let smallest = i;
+      const left = 2 * i + 1;
+      const right = 2 * i + 2;
+      if (left < n && this.cmp(this.items[left]!, this.items[smallest]!) < 0) smallest = left;
+      if (right < n && this.cmp(this.items[right]!, this.items[smallest]!) < 0) smallest = right;
+      if (smallest === i) break;
+      [this.items[i], this.items[smallest]] = [this.items[smallest]!, this.items[i]!];
+      i = smallest;
+    }
+  }
+}
+
 export class HNSWIndex {
   private nodes: Map<string, HNSWNode> = new Map();
   private entryPoint: string | null = null;
@@ -32,7 +81,10 @@ export class HNSWIndex {
   }
 
   private randomLayer(): number {
-    return Math.floor(-Math.log(Math.random()) * this.mL);
+    const r = Math.random() || Number.MIN_VALUE;
+    const raw = Math.floor(-Math.log(r) * this.mL);
+    const maxAllowed = Math.max(16, Math.floor(Math.log2(this.nodes.size + 2) * 2));
+    return Math.min(raw, maxAllowed);
   }
 
   private dist(a: Float32Array, b: Float32Array, normA?: number, normB?: number): number {
@@ -145,27 +197,16 @@ export class HNSWIndex {
     const visited = new Set<string>([entryKey]);
     const entryDist = this.dist(query, entryNode.vector, queryNorm, entryNode.norm);
 
-    // candidates: min-heap by distance (closest first)
-    const candidates: ScoredResult[] = [{ key: entryKey, score: entryDist }];
-    // results: all found within ef
-    const results: ScoredResult[] = [{ key: entryKey, score: entryDist }];
+    const candidates = new BinaryHeap((a, b) => a.score - b.score);  // min-heap
+    const results = new BinaryHeap((a, b) => b.score - a.score);     // max-heap
+    candidates.push({ key: entryKey, score: entryDist });
+    results.push({ key: entryKey, score: entryDist });
 
-    while (candidates.length > 0) {
-      // Pop closest candidate
-      let minIdx = 0;
-      for (let i = 1; i < candidates.length; i++) {
-        if (candidates[i]!.score < candidates[minIdx]!.score) minIdx = i;
-      }
-      const current = candidates[minIdx]!;
-      candidates.splice(minIdx, 1);
+    while (candidates.size > 0) {
+      const current = candidates.pop()!;
+      const worstDist = results.peek()!.score;
 
-      // Find worst in results
-      let worstDist = -Infinity;
-      for (const r of results) {
-        if (r.score > worstDist) worstDist = r.score;
-      }
-
-      if (current.score > worstDist && results.length >= ef) break;
+      if (current.score > worstDist && results.size >= ef) break;
 
       const currentNode = this.nodes.get(current.key);
       if (!currentNode || layer >= currentNode.neighbors.length) continue;
@@ -178,30 +219,21 @@ export class HNSWIndex {
         if (!neighbor || neighbor.deleted) continue;
 
         const d = this.dist(query, neighbor.vector, queryNorm, neighbor.norm);
+        const worstResult = results.peek()!.score;
 
-        let worstResult = -Infinity;
-        for (const r of results) {
-          if (r.score > worstResult) worstResult = r.score;
-        }
-
-        if (d < worstResult || results.length < ef) {
+        if (d < worstResult || results.size < ef) {
           candidates.push({ key: neighborKey, score: d });
           results.push({ key: neighborKey, score: d });
-
-          if (results.length > ef) {
-            // Remove worst
-            let worstIdx = 0;
-            for (let i = 1; i < results.length; i++) {
-              if (results[i]!.score > results[worstIdx]!.score) worstIdx = i;
-            }
-            results.splice(worstIdx, 1);
-          }
+          if (results.size > ef) results.pop();
         }
       }
     }
 
-    results.sort((a, b) => a.score - b.score);
-    return results;
+    // Drain max-heap into sorted array (ascending)
+    const out: ScoredResult[] = [];
+    while (results.size > 0) out.push(results.pop()!);
+    out.reverse();
+    return out;
   }
 
   private selectNeighbors(
@@ -363,5 +395,144 @@ export class HNSWIndex {
     }
 
     return results;
+  }
+
+  getEntryPoint(): string | null {
+    return this.entryPoint;
+  }
+
+  getMaxLayer(): number {
+    return this.maxLayer;
+  }
+
+  serialize(): Uint8Array {
+    const encoder = new TextEncoder();
+    const parts: Uint8Array[] = [];
+
+    // Entry point
+    const epBytes = this.entryPoint ? encoder.encode(this.entryPoint) : new Uint8Array(0);
+    const epHeader = new Uint8Array(2);
+    new DataView(epHeader.buffer).setUint16(0, epBytes.byteLength, true);
+    parts.push(epHeader, epBytes);
+
+    // Max layer
+    parts.push(new Uint8Array([this.maxLayer + 128])); // offset by 128 to handle -1
+
+    // Node count
+    const countBuf = new Uint8Array(4);
+    new DataView(countBuf.buffer).setUint32(0, this.nodes.size, true);
+    parts.push(countBuf);
+
+    // Each node: key + layer count + neighbor lists
+    for (const [key, node] of this.nodes) {
+      const keyBytes = encoder.encode(key);
+      const keyHeader = new Uint8Array(2);
+      new DataView(keyHeader.buffer).setUint16(0, keyBytes.byteLength, true);
+      parts.push(keyHeader, keyBytes);
+
+      // Layer count
+      parts.push(new Uint8Array([node.neighbors.length]));
+
+      for (let lc = 0; lc < node.neighbors.length; lc++) {
+        const neighbors = node.neighbors[lc]!;
+        const nCountBuf = new Uint8Array(2);
+        new DataView(nCountBuf.buffer).setUint16(0, neighbors.size, true);
+        parts.push(nCountBuf);
+
+        for (const nKey of neighbors) {
+          const nKeyBytes = encoder.encode(nKey);
+          const nKeyHeader = new Uint8Array(2);
+          new DataView(nKeyHeader.buffer).setUint16(0, nKeyBytes.byteLength, true);
+          parts.push(nKeyHeader, nKeyBytes);
+        }
+      }
+    }
+
+    // Concatenate
+    let totalLen = 0;
+    for (const p of parts) totalLen += p.byteLength;
+    const result = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const p of parts) {
+      result.set(p, offset);
+      offset += p.byteLength;
+    }
+    return result;
+  }
+
+  static deserialize(
+    data: Uint8Array,
+    offset: number,
+    nodesMap: Map<string, { vector: Float32Array; norm: number; metadata?: Record<string, unknown>; layer?: number }>,
+    dimension: number,
+    metric: DistanceMetric,
+    M: number,
+    efConstruction: number,
+  ): { index: HNSWIndex; bytesRead: number } {
+    const decoder = new TextDecoder();
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const startOffset = offset;
+
+    const index = new HNSWIndex(dimension, metric, M, efConstruction);
+
+    // Entry point
+    const epLen = view.getUint16(offset, true);
+    offset += 2;
+    const entryPoint = epLen > 0 ? decoder.decode(data.subarray(offset, offset + epLen)) : null;
+    offset += epLen;
+
+    // Max layer
+    const maxLayer = data[offset]! - 128;
+    offset += 1;
+
+    // Node count
+    const nodeCount = view.getUint32(offset, true);
+    offset += 4;
+
+    // Rebuild nodes with topology
+    for (let i = 0; i < nodeCount; i++) {
+      const keyLen = view.getUint16(offset, true);
+      offset += 2;
+      const key = decoder.decode(data.subarray(offset, offset + keyLen));
+      offset += keyLen;
+
+      const layerCount = data[offset]!;
+      offset += 1;
+
+      const neighbors: Set<string>[] = [];
+      for (let lc = 0; lc < layerCount; lc++) {
+        const nCount = view.getUint16(offset, true);
+        offset += 2;
+        const neighborSet = new Set<string>();
+        for (let n = 0; n < nCount; n++) {
+          const nKeyLen = view.getUint16(offset, true);
+          offset += 2;
+          const nKey = decoder.decode(data.subarray(offset, offset + nKeyLen));
+          offset += nKeyLen;
+          neighborSet.add(nKey);
+        }
+        neighbors.push(neighborSet);
+      }
+
+      // Get vector data from nodesMap
+      const nodeData = nodesMap.get(key);
+      if (nodeData) {
+        const node: HNSWNode = {
+          key,
+          vector: nodeData.vector,
+          norm: nodeData.norm,
+          metadata: nodeData.metadata,
+          layer: layerCount - 1,
+          neighbors,
+          deleted: false,
+        };
+        index.nodes.set(key, node);
+      }
+    }
+
+    index.entryPoint = entryPoint;
+    index.maxLayer = maxLayer;
+
+    return { index, bytesRead: offset - startOffset };
   }
 }

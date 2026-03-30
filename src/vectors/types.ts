@@ -119,7 +119,8 @@ export const enum VectorWalOp {
 }
 
 export const VECTOR_MAGIC = new Uint8Array([0x56, 0x45, 0x43, 0x54]); // "VECT"
-export const VECTOR_FORMAT_VERSION = 1;
+export const VECTOR_FORMAT_VERSION = 2;
+export const GRAPH_MARKER = new Uint8Array([0x47, 0x52, 0x50, 0x48]); // "GRPH"
 
 // === Events ===
 export type VectorEventType = "putVectors" | "deleteVectors" | "createIndex" | "deleteIndex";
@@ -128,6 +129,7 @@ export type VectorEventCallback = (indexName: string, keys?: string[]) => void;
 // === Client Options ===
 export interface VectorClientOptions {
   path?: string;
+  syncMode?: "full" | "normal" | "off";
 }
 
 // === HNSW Internal Types ===

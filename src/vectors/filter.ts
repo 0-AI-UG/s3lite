@@ -1,7 +1,11 @@
 import type { MetadataFilter, FilterValue, FilterOperator } from "./types";
 
+const KNOWN_OPS = new Set(["$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin"]);
+
 function isFilterOperator(v: unknown): v is FilterOperator {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const keys = Object.keys(v);
+  return keys.length > 0 && keys.every(k => KNOWN_OPS.has(k));
 }
 
 function evalOperator(value: unknown, op: FilterOperator): boolean {

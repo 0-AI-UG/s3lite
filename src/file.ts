@@ -41,16 +41,13 @@ export class S3File extends Blob {
   }
 
   override get size(): number {
-    try {
-      return this.getData().byteLength;
-    } catch {
-      return 0;
-    }
+    const s = this.store.stat(this.bucket, this.name);
+    return s?.size ?? 0;
   }
 
   override get type(): string {
-    const obj = this.store.get(this.bucket, this.name);
-    return obj?.contentType ?? this.opts.type ?? guessMimeType(this.name);
+    const s = this.store.stat(this.bucket, this.name);
+    return s?.type ?? this.opts.type ?? guessMimeType(this.name);
   }
 
   override async text(): Promise<string> {
@@ -115,17 +112,17 @@ export class S3File extends Blob {
     return bytes.byteLength;
   }
 
-  async exists(): Promise<boolean> {
+  exists(): boolean {
     return this.store.exists(this.bucket, this.name);
   }
 
-  async stat(): Promise<S3Stats> {
+  stat(): S3Stats {
     const s = this.store.stat(this.bucket, this.name);
     if (!s) throw new Error(`S3File not found: ${this.bucket}/${this.name}`);
     return s;
   }
 
-  async delete(): Promise<void> {
+  delete(): void {
     this.store.delete(this.bucket, this.name);
   }
 

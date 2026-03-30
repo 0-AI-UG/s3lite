@@ -45,6 +45,7 @@ export class NetworkSink {
       data,
       this.opts.type,
       this.opts.contentDisposition,
+      this.opts.expires,
     );
     const size = data.byteLength;
     this.chunks = [];

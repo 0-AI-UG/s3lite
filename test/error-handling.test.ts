@@ -75,15 +75,15 @@ test("S3File: json() throws for non-existent file", async () => {
   expect(file.json()).rejects.toThrow();
 });
 
-test("S3File: stat() throws for non-existent file", async () => {
+test("S3File: stat() throws for non-existent file", () => {
   client = new S3Client({ bucket: "b" });
   const file = client.file("ghost.txt");
-  expect(file.stat()).rejects.toThrow("not found");
+  expect(() => file.stat()).toThrow("not found");
 });
 
-test("S3File: exists() returns false for non-existent file", async () => {
+test("S3File: exists() returns false for non-existent file", () => {
   client = new S3Client({ bucket: "b" });
-  expect(await client.file("ghost.txt").exists()).toBe(false);
+  expect(client.file("ghost.txt").exists()).toBe(false);
 });
 
 test("S3File: size returns 0 for non-existent file", () => {
@@ -91,9 +91,9 @@ test("S3File: size returns 0 for non-existent file", () => {
   expect(client.file("ghost.txt").size).toBe(0);
 });
 
-test("S3File: delete non-existent file does not throw", async () => {
+test("S3File: delete non-existent file does not throw", () => {
   client = new S3Client({ bucket: "b" });
-  await client.file("ghost.txt").delete(); // should not throw
+  client.file("ghost.txt").delete(); // should not throw
 });
 
 test("S3File: stream() throws for non-existent file", () => {
@@ -128,7 +128,7 @@ test("NetworkSink: end with no writes stores empty data", async () => {
 test("S3Client: unlink is an alias for delete", async () => {
   client = new S3Client({ bucket: "b" });
   await client.write("alias.txt", "data");
-  expect(await client.exists("alias.txt")).toBe(true);
-  await client.unlink("alias.txt");
-  expect(await client.exists("alias.txt")).toBe(false);
+  expect(client.exists("alias.txt")).toBe(true);
+  client.unlink("alias.txt");
+  expect(client.exists("alias.txt")).toBe(false);
 });
