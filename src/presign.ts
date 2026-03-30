@@ -114,7 +114,7 @@ export class PresignHandler {
       if (rangeHeader) {
         const match = rangeHeader.match(/^bytes=(\d+)-(\d*)$/);
         if (match) {
-          const start = parseInt(match[1], 10);
+          const start = parseInt(match[1]!, 10);
           const end = match[2] ? parseInt(match[2], 10) : data.byteLength - 1;
           const clampedEnd = Math.min(end, data.byteLength - 1);
           if (start > clampedEnd || start >= data.byteLength) {

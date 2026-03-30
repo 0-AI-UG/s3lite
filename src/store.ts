@@ -309,7 +309,7 @@ export class Store {
     };
 
     if (isTruncated && truncatedContents.length > 0) {
-      const lastKey = truncatedContents[truncatedContents.length - 1].key;
+      const lastKey = truncatedContents[truncatedContents.length - 1]!.key;
       response.nextContinuationToken = lastKey;
     }
 
