@@ -4,6 +4,8 @@ Embedded S3-compatible storage engine with WAL-based persistence. SQLite for obj
 
 The API mirrors Bun's built-in `S3Client` — swap imports and it works. Useful for local development, testing, or single-server deployments where you don't need a real S3 backend.
 
+Also includes **s3lite-vectors** — an embedded vector store with HNSW indexing, sparse vectors, hybrid search with RRF fusion, and metadata filtering. Think of it as SQLite for vector search.
+
 ## Install
 
 ```sh
@@ -122,6 +124,129 @@ const s3 = new S3Client({ bucket: "app", accessKeyId: "...", secretAccessKey: ".
 ```
 
 The one exception is `presign()` — on a real S3 client it returns signed AWS URLs directly. With s3lite, use `PresignHandler` to serve the files through your own server.
+
+## Vectors
+
+s3lite includes a built-in vector store for similarity search. Import from `@0-ai/s3lite/vectors`.
+
+```ts
+import { VectorClient } from "@0-ai/s3lite/vectors";
+
+// In-memory
+const vectors = new VectorClient();
+
+// With disk persistence
+const vectors = new VectorClient({ path: "./vectors.db" });
+```
+
+### Create an Index
+
+```ts
+vectors.createIndex({
+  name: "movies",
+  dimension: 1536,
+  distanceMetric: "cosine", // "cosine" | "euclidean" | "dotproduct"
+  hnswConfig: { M: 16, efConstruction: 200 },
+});
+```
+
+### Insert Vectors
+
+```ts
+vectors.putVectors("movies", [
+  { key: "star-wars", vector: [0.1, 0.2, ...], metadata: { genre: "scifi", year: 1977 } },
+  { key: "titanic", vector: [0.3, 0.4, ...], metadata: { genre: "drama", year: 1997 } },
+]);
+```
+
+### Query
+
+```ts
+const { results } = vectors.query("movies", {
+  vector: [0.1, 0.2, ...],
+  topK: 10,
+  efSearch: 100,
+  includeMetadata: true,
+  filter: { genre: "scifi" },
+});
+// results → [{ key: "star-wars", score: 0.98, metadata: { ... } }, ...]
+```
+
+### Metadata Filtering
+
+Filters support comparison operators:
+
+```ts
+vectors.query("movies", {
+  vector: queryVec,
+  topK: 5,
+  filter: {
+    genre: { $in: ["scifi", "action"] },
+    year: { $gte: 1990 },
+  },
+});
+```
+
+Available operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`.
+
+### Sparse & Hybrid Search
+
+Create a sparse-enabled index and use RRF (Reciprocal Rank Fusion) to combine dense + sparse results:
+
+```ts
+vectors.createIndex({ name: "docs", dimension: 768, sparse: true });
+
+vectors.putVectors("docs", [
+  {
+    key: "doc1",
+    vector: denseVec,
+    sparseVector: { indices: [10, 42, 99], values: [0.5, 0.3, 0.8] },
+  },
+]);
+
+// Hybrid query (dense + sparse with RRF fusion)
+const { results } = vectors.query("docs", {
+  vector: queryDense,
+  sparseVector: { indices: [42, 99], values: [0.4, 0.7] },
+  topK: 10,
+  fusionK: 60,
+});
+```
+
+### Manage Vectors & Indexes
+
+```ts
+// Get vectors by key
+const vecs = vectors.getVectors("movies", ["star-wars", "titanic"]);
+
+// List vector keys
+const { keys } = vectors.listVectors("movies", { prefix: "star", maxKeys: 100 });
+
+// Delete vectors
+vectors.deleteVectors("movies", ["titanic"]);
+
+// List all indexes
+const { indexes } = vectors.listIndexes();
+
+// Delete an index
+vectors.deleteIndex("movies");
+```
+
+### Events
+
+```ts
+vectors.on("putVectors", (indexName, keys) => {
+  console.log(`Upserted ${keys?.length} vectors in ${indexName}`);
+});
+// Events: "putVectors" | "deleteVectors" | "createIndex" | "deleteIndex"
+```
+
+### Cleanup
+
+```ts
+vectors.checkpoint(); // flush WAL
+vectors.close();      // flush and close
+```
 
 ## Development
 
