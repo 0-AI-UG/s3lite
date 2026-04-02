@@ -7,6 +7,7 @@ export { Store, TransactionContext } from "./store";
 export { reconcile } from "./reconcile";
 export type { ReconcileOptions, ReconcileReport } from "./reconcile";
 export type { IntegrityReport } from "./wal";
+export { ReadonlyError } from "./types";
 export type {
   S3Options,
   S3FilePresignOptions,

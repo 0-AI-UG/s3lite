@@ -10,6 +10,7 @@ import {
   fsyncSync,
 } from "node:fs";
 import { writeFileSync } from "node:fs";
+import { ReadonlyError } from "./types";
 
 type SyncMode = "full" | "normal" | "off";
 
@@ -19,16 +20,29 @@ export class BlobLog {
   private currentSize: number;
   private deadBytes = 0;
   private syncMode: SyncMode;
+  private readOnly: boolean;
 
-  constructor(path: string, syncMode: SyncMode = "normal") {
+  constructor(path: string, syncMode: SyncMode = "normal", readOnly = false) {
     this.path = path;
     this.syncMode = syncMode;
+    this.readOnly = readOnly;
     const exists = existsSync(path);
-    this.fd = openSync(path, exists ? "r+" : "w+");
-    this.currentSize = exists ? fstatSync(this.fd).size : 0;
+    if (readOnly) {
+      if (exists) {
+        this.fd = openSync(path, "r");
+        this.currentSize = fstatSync(this.fd).size;
+      } else {
+        this.fd = -1;
+        this.currentSize = 0;
+      }
+    } else {
+      this.fd = openSync(path, exists ? "r+" : "w+");
+      this.currentSize = exists ? fstatSync(this.fd).size : 0;
+    }
   }
 
   append(data: Uint8Array): { offset: number; length: number } {
+    if (this.readOnly) throw new ReadonlyError("write");
     const offset = this.currentSize;
     writeSync(this.fd, data, 0, data.byteLength, offset);
     this.currentSize += data.byteLength;
@@ -39,6 +53,7 @@ export class BlobLog {
   }
 
   read(offset: number, length: number): Uint8Array {
+    if (this.fd === -1) throw new Error("Object has no data and no blob reference");
     const buf = Buffer.alloc(length);
     readSync(this.fd, buf, 0, length, offset);
     return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -57,6 +72,7 @@ export class BlobLog {
   }
 
   markDead(length: number): void {
+    if (this.readOnly) throw new ReadonlyError("write");
     this.deadBytes += length;
   }
 
@@ -67,6 +83,7 @@ export class BlobLog {
   compact(
     liveEntries: { oldOffset: number; length: number }[],
   ): Map<number, number> {
+    if (this.readOnly) throw new ReadonlyError("compact");
     if (liveEntries.length === 0) {
       closeSync(this.fd);
       writeFileSync(this.path, new Uint8Array(0));
@@ -115,6 +132,6 @@ export class BlobLog {
   }
 
   close(): void {
-    closeSync(this.fd);
+    if (this.fd !== -1) closeSync(this.fd);
   }
 }

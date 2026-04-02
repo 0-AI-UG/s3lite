@@ -10,6 +10,13 @@ export interface StoredObject {
   blobLength?: number;
 }
 
+export class ReadonlyError extends Error {
+  constructor(operation: string) {
+    super(`Cannot ${operation} on a read-only database`);
+    this.name = "ReadonlyError";
+  }
+}
+
 export interface S3Options {
   bucket?: string;
   region?: string;
@@ -35,6 +42,8 @@ export interface S3Options {
   syncMode?: "full" | "normal" | "off";
   /** Index mode. "memory" loads all keys in RAM (fast, limited scale). "disk" uses sparse disk index (millions of keys, lower RAM). Default: "memory" */
   indexMode?: "memory" | "disk";
+  /** Open in read-only mode. No file lock is acquired and all write operations throw. Multiple readers can coexist with a writer. */
+  readonly?: boolean;
 }
 
 export interface S3FilePresignOptions extends S3Options {

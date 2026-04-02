@@ -43,6 +43,7 @@ export class DiskIndex {
   private mainSize = 0;
   private sparseIndex: SparseEntry[] = [];
   private totalCount = 0;
+  private allOffsets: Uint32Array = new Uint32Array(0);
   /** Overlay: compositeKey → StoredObject | null (null = tombstone) */
   private overlay: Map<string, StoredObject | null> = new Map();
   /** Track which bucket+keys exist on disk (not in overlay). Needed for accurate has/delete. */
@@ -86,13 +87,14 @@ export class DiskIndex {
     this.totalCount = 0;
 
     let offset = this.headerSize;
-    const decoder = new TextDecoder();
+    const offsets: number[] = [];
 
     while (offset < this.mainSize) {
       const recordStart = offset;
       const rec = this.readRecordHeader(offset);
       if (!rec) break;
 
+      offsets.push(recordStart);
       const ck = compositeKey(rec.bucket, rec.key);
 
       if (this.totalCount % SPARSE_INTERVAL === 0) {
@@ -103,6 +105,7 @@ export class DiskIndex {
       offset = rec.nextOffset;
     }
 
+    this.allOffsets = new Uint32Array(offsets);
     this.diskKeyCount = this.totalCount;
   }
 
@@ -359,10 +362,11 @@ export class DiskIndex {
     );
     let oIdx = 0;
 
-    // Scan disk sequentially
-    let diskOffset = this.mainFd ? this.headerSize : this.mainSize + 1;
+    // Use cached offsets for disk iteration (avoids re-parsing headers to find next record)
+    let diskIdx = 0;
+    const offsets = this.allOffsets;
 
-    let diskRec = this.nextDiskRecord(diskOffset);
+    let diskRec = this.mainFd && diskIdx < offsets.length ? this.readFullRecord(offsets[diskIdx]!) : null;
     let overlayEntry = oIdx < overlayEntries.length ? overlayEntries[oIdx] : null;
 
     while (diskRec || overlayEntry) {
@@ -377,7 +381,8 @@ export class DiskIndex {
         } else {
           // Same key — overlay wins, skip disk
           useOverlay = true;
-          diskRec = this.nextDiskRecord(diskRec.fileOffset + diskRec.recordLength);
+          diskIdx++;
+          diskRec = diskIdx < offsets.length ? this.readFullRecord(offsets[diskIdx]!) : null;
         }
       } else if (diskRec) {
         useDisk = true;
@@ -388,7 +393,8 @@ export class DiskIndex {
       if (useDisk && diskRec) {
         const [bucket, key] = splitComposite(diskRec.compositeKey);
         yield [bucket, key, diskRec.obj];
-        diskRec = this.nextDiskRecord(diskRec.fileOffset + diskRec.recordLength);
+        diskIdx++;
+        diskRec = diskIdx < offsets.length ? this.readFullRecord(offsets[diskIdx]!) : null;
       }
 
       if (useOverlay && overlayEntry) {
@@ -424,6 +430,11 @@ export class DiskIndex {
     return null;
   }
 
+  /** Check if overlay has grown large enough to warrant a checkpoint. */
+  shouldCompactOverlay(): boolean {
+    return this.overlay.size >= 50000;
+  }
+
   /** Clear the overlay (called after checkpoint). */
   clearOverlay(): void {
     this.overlay.clear();
@@ -436,6 +447,7 @@ export class DiskIndex {
       this.mainFd = null;
     }
     this.sparseIndex = [];
+    this.allOffsets = new Uint32Array(0);
     this.totalCount = 0;
     this.diskKeyCount = 0;
     this.overlay.clear();

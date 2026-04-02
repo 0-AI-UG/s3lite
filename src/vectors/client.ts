@@ -18,7 +18,7 @@ export class VectorClient {
   private store: VectorStore;
 
   constructor(options?: VectorClientOptions) {
-    this.store = new VectorStore(options?.path, options?.syncMode);
+    this.store = new VectorStore(options?.path, options?.syncMode, options?.readonly);
   }
 
   createIndex(opts: CreateIndexOptions): VectorIndexConfig {

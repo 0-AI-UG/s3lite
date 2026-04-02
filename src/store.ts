@@ -1,11 +1,12 @@
 import { copyFileSync, existsSync } from "node:fs";
-import type {
-  StoredObject,
-  S3ListObjectsOptions,
-  S3ListObjectsResponse,
-  S3Stats,
-  S3EventType,
-  S3EventCallback,
+import {
+  ReadonlyError,
+  type StoredObject,
+  type S3ListObjectsOptions,
+  type S3ListObjectsResponse,
+  type S3Stats,
+  type S3EventType,
+  type S3EventCallback,
 } from "./types";
 import { WAL, type IntegrityReport } from "./wal";
 import { BlobLog } from "./blob";
@@ -64,14 +65,18 @@ export class Store {
   private listeners: Map<S3EventType, Set<S3EventCallback>> = new Map();
   private inTransaction = false;
   private pendingEvents: Array<[S3EventType, string, string]> = [];
+  private readOnly: boolean;
 
-  constructor(path?: string, syncMode: SyncMode = "normal", indexMode: IndexMode = "memory") {
+  constructor(path?: string, syncMode: SyncMode = "normal", indexMode: IndexMode = "memory", readOnly = false) {
+    this.readOnly = readOnly;
     if (path) {
       this.mainPath = path;
-      this.lock = new FileLock(path);
-      this.lock.acquire();
-      this.wal = new WAL(path, syncMode);
-      this.blobLog = new BlobLog(path + "-blobs", syncMode);
+      if (!readOnly) {
+        this.lock = new FileLock(path);
+        this.lock.acquire();
+      }
+      this.wal = new WAL(path, syncMode, undefined, readOnly);
+      this.blobLog = new BlobLog(path + "-blobs", syncMode, readOnly);
 
       if (indexMode === "disk") {
         this.diskIdx = new DiskIndex(path);
@@ -168,6 +173,7 @@ export class Store {
     contentDisposition?: string,
     expires?: number,
   ): void {
+    if (this.readOnly) throw new ReadonlyError("put");
     const etag = computeETag(data);
     const lastModified = new Date();
     const resolvedType = contentType ?? guessMimeType(key);
@@ -198,7 +204,7 @@ export class Store {
       if (!this.inTransaction) {
         if (this.blobLog.shouldCompact()) {
           this.compactAndCheckpoint();
-        } else if (this.wal!.shouldCheckpoint()) {
+        } else if (this.wal!.shouldCheckpoint() || (this.diskIdx && this.diskIdx.shouldCompactOverlay())) {
           if (this.diskIdx) {
             // Disk index requires sorted main file; do full checkpoint
             this.wal!.checkpointFromIterator(this.diskIdx.entries(), true);
@@ -227,7 +233,7 @@ export class Store {
     const obj = this.indexGet(bucket, key);
     if (!obj) return undefined;
     if (this.isExpired(obj)) {
-      this.delete(bucket, key);
+      if (!this.readOnly) this.delete(bucket, key);
       return undefined;
     }
     return obj;
@@ -268,6 +274,7 @@ export class Store {
   }
 
   delete(bucket: string, key: string): boolean {
+    if (this.readOnly) throw new ReadonlyError("delete");
     const obj = this.indexGet(bucket, key);
     if (!obj) return false;
     const existed = this.indexDelete(bucket, key);
@@ -285,7 +292,7 @@ export class Store {
     const obj = this.indexGet(bucket, key);
     if (!obj) return false;
     if (this.isExpired(obj)) {
-      this.delete(bucket, key);
+      if (!this.readOnly) this.delete(bucket, key);
       return false;
     }
     return true;
@@ -308,6 +315,7 @@ export class Store {
     destBucket: string,
     destKey: string,
   ): boolean {
+    if (this.readOnly) throw new ReadonlyError("copy");
     const obj = this.getObject(srcBucket, srcKey);
     if (!obj) return false;
 
@@ -366,7 +374,7 @@ export class Store {
     for (const [key, obj] of iterate) {
       if (!key.startsWith(prefix)) continue;
       if (this.isExpired(obj)) {
-        this.delete(bucket, key);
+        if (!this.readOnly) this.delete(bucket, key);
         continue;
       }
       if (effectiveStartAfter && key <= effectiveStartAfter) continue;
@@ -473,6 +481,7 @@ export class Store {
   }
 
   transaction(fn: (txn: TransactionContext) => void): void {
+    if (this.readOnly) throw new ReadonlyError("transaction");
     if (this.inTransaction) throw new Error("Nested transactions are not supported");
 
     const txn = new TransactionContext();
@@ -483,6 +492,7 @@ export class Store {
     this.inTransaction = true;
 
     if (this.wal) {
+      this.wal.beginBatch();
       this.wal.appendTxnBegin();
     }
 
@@ -492,7 +502,7 @@ export class Store {
       const snapKey = op.bucket + "\0" + op.key;
       if (!snapshots.has(snapKey)) {
         const existing = this.indexGet(op.bucket, op.key);
-        snapshots.set(snapKey, existing ? { ...existing, data: existing.data?.slice() ?? null } : undefined);
+        snapshots.set(snapKey, existing ? { ...existing } : undefined);
       }
     }
 
@@ -517,6 +527,7 @@ export class Store {
         }
       }
       if (this.wal) {
+        this.wal.discardBatch();
         this.wal.truncateUncommitted();
       }
       throw err;
@@ -532,6 +543,7 @@ export class Store {
   }
 
   checkpoint(): void {
+    if (this.readOnly) throw new ReadonlyError("checkpoint");
     if (!this.wal) return;
 
     if (this.blobLog) {
@@ -558,12 +570,14 @@ export class Store {
 
   /** Repair corrupt records by skipping them and rewriting clean data. Returns report of what was found. */
   repair(): IntegrityReport {
+    if (this.readOnly) throw new ReadonlyError("repair");
     if (!this.wal) return { totalRecords: 0, validRecords: 0, corruptRecords: [], ok: true };
     return this.wal.repair();
   }
 
   /** Create a consistent backup of the database at destPath. */
   backup(destPath: string): void {
+    if (this.readOnly) throw new ReadonlyError("backup");
     if (!this.wal) throw new Error("Cannot backup an in-memory store");
 
     // Checkpoint to flush WAL into main file, producing a self-contained snapshot
@@ -580,6 +594,12 @@ export class Store {
   }
 
   close(): void {
+    if (this.readOnly) {
+      if (this.blobLog) this.blobLog.close();
+      if (this.wal) this.wal.closeFd();
+      if (this.diskIdx) this.diskIdx.close();
+      return;
+    }
     if (this.diskIdx) {
       if (this.blobLog) {
         this.compactAndCheckpoint();

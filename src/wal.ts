@@ -12,6 +12,7 @@ import {
   MAGIC,
   FORMAT_VERSION,
   WalOp,
+  ReadonlyError,
   type StoredObject,
 } from "./types";
 import { crc32, concatUint8Arrays } from "./utils";
@@ -376,12 +377,16 @@ export class WAL {
   private syncMode: SyncMode;
   private mainFileSize = 0;
   private cleanMainSize = 0; // size after last full checkpoint
+  private batchBuf: Uint8Array[] | null = null;
+  private batchBytes = 0;
+  private readOnly: boolean;
 
-  constructor(path: string, syncMode: SyncMode = "normal", checkpointThreshold = 10 * 1024 * 1024) {
+  constructor(path: string, syncMode: SyncMode = "normal", checkpointThreshold = 10 * 1024 * 1024, readOnly = false) {
     this.mainPath = path;
     this.walPath = path + "-wal";
     this.checkpointThreshold = checkpointThreshold;
     this.syncMode = syncMode;
+    this.readOnly = readOnly;
   }
 
   open(objects: ObjectMap): void {
@@ -417,8 +422,53 @@ export class WAL {
       this.walSize = walBuf.byteLength;
     }
 
-    // Open WAL fd for appending (create if needed)
-    this.walFd = openSync(this.walPath, existsSync(this.walPath) ? "a" : "w");
+    // Open WAL fd for appending (create if needed) — skip in read-only mode
+    if (!this.readOnly) {
+      this.walFd = openSync(this.walPath, existsSync(this.walPath) ? "a" : "w");
+    }
+  }
+
+  beginBatch(): void {
+    this.batchBuf = [];
+    this.batchBytes = 0;
+  }
+
+  endBatch(): void {
+    if (!this.batchBuf || this.batchBuf.length === 0) {
+      this.batchBuf = null;
+      this.batchBytes = 0;
+      return;
+    }
+    const combined = concatUint8Arrays(this.batchBuf);
+    writeSync(this.walFd!, combined, 0, combined.byteLength);
+    this.walSize += combined.byteLength;
+    if (this.syncMode === "full") {
+      fsyncSync(this.walFd!);
+    }
+    this.batchBuf = null;
+    this.batchBytes = 0;
+  }
+
+  discardBatch(): void {
+    this.batchBuf = null;
+    this.batchBytes = 0;
+  }
+
+  private writeRecord(record: Uint8Array): void {
+    if (this.batchBuf) {
+      this.batchBuf.push(record);
+      this.batchBytes += record.byteLength;
+    } else {
+      writeSync(this.walFd!, record, 0, record.byteLength);
+      this.walSize += record.byteLength;
+      if (this.syncMode === "full") {
+        fsyncSync(this.walFd!);
+      }
+    }
+  }
+
+  private guardReadonly(): void {
+    if (this.readOnly) throw new ReadonlyError("write");
   }
 
   appendPut(
@@ -427,34 +477,28 @@ export class WAL {
     data: Uint8Array | null,
     metadata: Record<string, unknown>,
   ): void {
-    const record = encodeRecord(WalOp.PUT, bucket, key, metadata, data);
-    writeSync(this.walFd!, record, 0, record.byteLength);
-    this.walSize += record.byteLength;
-    if (this.syncMode === "full") {
-      fsyncSync(this.walFd!);
-    }
+    this.guardReadonly();
+    this.writeRecord(encodeRecord(WalOp.PUT, bucket, key, metadata, data));
   }
 
   appendDelete(bucket: string, key: string): void {
-    const record = encodeRecord(WalOp.DELETE, bucket, key, null, null);
-    writeSync(this.walFd!, record, 0, record.byteLength);
-    this.walSize += record.byteLength;
-    if (this.syncMode === "full") {
-      fsyncSync(this.walFd!);
-    }
+    this.guardReadonly();
+    this.writeRecord(encodeRecord(WalOp.DELETE, bucket, key, null, null));
   }
 
   appendTxnBegin(): void {
-    this.txnStartSize = this.walSize;
-    const record = encodeRecord(WalOp.TXN_BEGIN, "", "", null, null);
-    writeSync(this.walFd!, record, 0, record.byteLength);
-    this.walSize += record.byteLength;
+    this.guardReadonly();
+    this.txnStartSize = this.walSize + this.batchBytes;
+    this.writeRecord(encodeRecord(WalOp.TXN_BEGIN, "", "", null, null));
   }
 
   appendTxnCommit(): void {
-    const record = encodeRecord(WalOp.TXN_COMMIT, "", "", null, null);
-    writeSync(this.walFd!, record, 0, record.byteLength);
-    this.walSize += record.byteLength;
+    this.guardReadonly();
+    this.writeRecord(encodeRecord(WalOp.TXN_COMMIT, "", "", null, null));
+    // Flush any pending batch so the commit is durable
+    if (this.batchBuf) {
+      this.endBatch();
+    }
     // Always fsync on commit to ensure atomicity
     if (this.syncMode !== "off") {
       fsyncSync(this.walFd!);
@@ -462,6 +506,7 @@ export class WAL {
   }
 
   truncateUncommitted(): void {
+    this.guardReadonly();
     ftruncateSync(this.walFd!, this.txnStartSize);
     this.walSize = this.txnStartSize;
   }
@@ -477,6 +522,7 @@ export class WAL {
 
   /** Append WAL bytes to the main file instead of rewriting everything. */
   incrementalCheckpoint(): void {
+    this.guardReadonly();
     if (this.walSize === 0) return;
 
     // Ensure main file exists with header
@@ -512,6 +558,7 @@ export class WAL {
   }
 
   checkpoint(objects: ObjectMap, blobBacked = false): void {
+    this.guardReadonly();
     const parts: Uint8Array[] = [];
 
     // Header
@@ -594,8 +641,10 @@ export class WAL {
       this.walSize = walBuf.byteLength;
     }
 
-    // Open WAL fd for appending
-    this.walFd = openSync(this.walPath, existsSync(this.walPath) ? "a" : "w");
+    // Open WAL fd for appending — skip in read-only mode
+    if (!this.readOnly) {
+      this.walFd = openSync(this.walPath, existsSync(this.walPath) ? "a" : "w");
+    }
   }
 
   /** Checkpoint from an iterator of [bucket, key, obj] triples (for DiskIndex mode).
@@ -604,6 +653,7 @@ export class WAL {
     entries: Iterable<[string, string, StoredObject]>,
     blobBacked = false,
   ): void {
+    this.guardReadonly();
     const parts: Uint8Array[] = [];
 
     const header = new Uint8Array(8);
@@ -692,6 +742,7 @@ export class WAL {
 
   /** Repair by re-reading all records, skipping corrupt ones, and rewriting the main file + WAL. */
   repair(): IntegrityReport {
+    this.guardReadonly();
     const objects: ObjectMap = new Map();
     const combined: IntegrityReport = { totalRecords: 0, validRecords: 0, corruptRecords: [], ok: true };
 
@@ -739,12 +790,12 @@ export class WAL {
   }
 
   close(objects: ObjectMap): void {
-    this.checkpoint(objects);
+    if (!this.readOnly) this.checkpoint(objects);
     this.closeFd();
   }
 
   closeDiskIndex(diskIndex: DiskIndex): void {
-    this.checkpointFromIterator(diskIndex.entries(), true);
+    if (!this.readOnly) this.checkpointFromIterator(diskIndex.entries(), true);
     if (this.walFd !== null) {
       closeSync(this.walFd);
       this.walFd = null;

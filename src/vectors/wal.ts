@@ -20,6 +20,7 @@ import {
 import { HNSWIndex } from "./hnsw";
 import { computeNorm } from "./distance";
 import { crc32 } from "../utils";
+import { ReadonlyError } from "../types";
 
 // Forward reference to avoid circular imports
 interface VectorStoreInterface {
@@ -228,12 +229,16 @@ export class VectorWAL {
   private walSize = 0;
   private checkpointThreshold: number;
   private syncMode: SyncMode;
+  private dirtyGraphs = new Set<string>();
+  private cachedGraphData = new Map<string, Uint8Array>();
+  private readOnly: boolean;
 
-  constructor(path: string, syncMode: SyncMode = "normal", checkpointThreshold = 10 * 1024 * 1024) {
+  constructor(path: string, syncMode: SyncMode = "normal", checkpointThreshold = 10 * 1024 * 1024, readOnly = false) {
     this.mainPath = path;
     this.walPath = path + "-wal";
     this.checkpointThreshold = checkpointThreshold;
     this.syncMode = syncMode;
+    this.readOnly = readOnly;
   }
 
   open(store: VectorStoreInterface): void {
@@ -281,8 +286,10 @@ export class VectorWAL {
       this.walSize = walBuf.byteLength;
     }
 
-    // Open persistent WAL fd
-    this.walFd = openSync(this.walPath, existsSync(this.walPath) ? "a" : "w");
+    // Open persistent WAL fd — skip in read-only mode
+    if (!this.readOnly) {
+      this.walFd = openSync(this.walPath, existsSync(this.walPath) ? "a" : "w");
+    }
   }
 
   private findGraphMarker(buf: Uint8Array, headerSize: number, records: ParsedRecord[]): number {
@@ -382,7 +389,12 @@ export class VectorWAL {
     }
   }
 
+  private guardReadonly(): void {
+    if (this.readOnly) throw new ReadonlyError("write");
+  }
+
   appendCreateIndex(config: VectorIndexConfig): void {
+    this.guardReadonly();
     const metadata: Record<string, unknown> = {
       dimension: config.dimension,
       distanceMetric: config.distanceMetric,
@@ -390,10 +402,14 @@ export class VectorWAL {
       hnswConfig: config.hnswConfig,
       createdAt: config.createdAt.toISOString(),
     };
+    this.dirtyGraphs.add(config.name);
     this.writeRecord(encodeRecord(VectorWalOp.CREATE_INDEX, config.name, "", metadata, null));
   }
 
   appendDeleteIndex(indexName: string): void {
+    this.guardReadonly();
+    this.dirtyGraphs.delete(indexName);
+    this.cachedGraphData.delete(indexName);
     this.writeRecord(encodeRecord(VectorWalOp.DELETE_INDEX, indexName, "", null, null));
   }
 
@@ -404,15 +420,19 @@ export class VectorWAL {
     metadata?: Record<string, unknown>,
     sparseVector?: SparseVector,
   ): void {
+    this.guardReadonly();
     const meta: Record<string, unknown> = {};
     if (metadata) meta.vectorMetadata = metadata;
     if (sparseVector) meta.sparseVector = sparseVector;
 
+    this.dirtyGraphs.add(indexName);
     const data = vector ? new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength) : null;
     this.writeRecord(encodeRecord(VectorWalOp.PUT_VECTOR, indexName, key, meta, data));
   }
 
   appendDeleteVector(indexName: string, key: string): void {
+    this.guardReadonly();
+    this.dirtyGraphs.add(indexName);
     this.writeRecord(encodeRecord(VectorWalOp.DELETE_VECTOR, indexName, key, null, null));
   }
 
@@ -421,6 +441,7 @@ export class VectorWAL {
   }
 
   checkpoint(store: VectorStoreInterface): void {
+    this.guardReadonly();
     // Write to temp file, then atomic rename
     const tmpPath = this.mainPath + ".tmp";
     const fd = openSync(tmpPath, "w");
@@ -485,13 +506,20 @@ export class VectorWAL {
       writeSync(fd, nameHeader, 0, 2);
       writeSync(fd, nameBytes, 0, nameBytes.byteLength);
 
-      // Serialize HNSW graph
-      const graphData = entry.hnsw.serialize();
+      // Only re-serialize dirty graphs; reuse cached data for clean ones
+      let graphData: Uint8Array;
+      if (this.dirtyGraphs.has(indexName) || !this.cachedGraphData.has(indexName)) {
+        graphData = entry.hnsw.serialize();
+        this.cachedGraphData.set(indexName, graphData);
+      } else {
+        graphData = this.cachedGraphData.get(indexName)!;
+      }
       const graphLenBuf = new Uint8Array(4);
       new DataView(graphLenBuf.buffer).setUint32(0, graphData.byteLength, true);
       writeSync(fd, graphLenBuf, 0, 4);
       writeSync(fd, graphData, 0, graphData.byteLength);
     }
+    this.dirtyGraphs.clear();
 
     if (this.syncMode !== "off") {
       fsyncSync(fd);
@@ -512,7 +540,7 @@ export class VectorWAL {
   }
 
   close(store: VectorStoreInterface): void {
-    this.checkpoint(store);
+    if (!this.readOnly) this.checkpoint(store);
     if (this.walFd !== null) {
       closeSync(this.walFd);
       this.walFd = null;

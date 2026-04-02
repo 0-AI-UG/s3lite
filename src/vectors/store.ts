@@ -19,22 +19,26 @@ import { HNSWIndex } from "./hnsw";
 import { SparseIndex } from "./sparse";
 import { matchesFilter } from "./filter";
 import { VectorWAL } from "./wal";
+import { ReadonlyError } from "../types";
 
 interface IndexEntry {
   config: VectorIndexConfig;
   hnsw: HNSWIndex;
   sparse: SparseIndex | null;
   vectors: Map<string, StoredVectorMeta>;
+  sortedKeysCache: string[] | null;
 }
 
 export class VectorStore {
   private indexes: Map<string, IndexEntry> = new Map();
   private wal: VectorWAL | null = null;
   private listeners: Map<VectorEventType, Set<VectorEventCallback>> = new Map();
+  private readOnly: boolean;
 
-  constructor(path?: string, syncMode: "full" | "normal" | "off" = "normal") {
+  constructor(path?: string, syncMode: "full" | "normal" | "off" = "normal", readOnly = false) {
+    this.readOnly = readOnly;
     if (path) {
-      this.wal = new VectorWAL(path, syncMode);
+      this.wal = new VectorWAL(path, syncMode, undefined, readOnly);
       this.wal.open(this);
     }
   }
@@ -42,6 +46,7 @@ export class VectorStore {
   // === Index Operations ===
 
   createIndex(opts: CreateIndexOptions): VectorIndexConfig {
+    if (this.readOnly) throw new ReadonlyError("createIndex");
     if (this.indexes.has(opts.name)) {
       throw new Error(`Index already exists: ${opts.name}`);
     }
@@ -63,7 +68,7 @@ export class VectorStore {
     const hnsw = new HNSWIndex(opts.dimension, distanceMetric, M, efConstruction);
     const sparseIdx = sparse ? new SparseIndex() : null;
 
-    this.indexes.set(opts.name, { config, hnsw, sparse: sparseIdx, vectors: new Map() });
+    this.indexes.set(opts.name, { config, hnsw, sparse: sparseIdx, vectors: new Map(), sortedKeysCache: null });
     this.wal?.appendCreateIndex(config);
     this.emit("createIndex", opts.name);
     return config;
@@ -74,7 +79,7 @@ export class VectorStore {
     if (this.indexes.has(config.name)) return;
     const hnsw = new HNSWIndex(config.dimension, config.distanceMetric, config.hnswConfig.M, config.hnswConfig.efConstruction);
     const sparseIdx = config.sparse ? new SparseIndex() : null;
-    this.indexes.set(config.name, { config, hnsw, sparse: sparseIdx, vectors: new Map() });
+    this.indexes.set(config.name, { config, hnsw, sparse: sparseIdx, vectors: new Map(), sortedKeysCache: null });
   }
 
   // Internal: delete index without WAL (used during replay)
@@ -87,6 +92,7 @@ export class VectorStore {
   }
 
   deleteIndex(name: string): boolean {
+    if (this.readOnly) throw new ReadonlyError("deleteIndex");
     const existed = this.indexes.delete(name);
     if (existed) {
       this.wal?.appendDeleteIndex(name);
@@ -102,7 +108,9 @@ export class VectorStore {
   // === Vector Operations ===
 
   putVectors(indexName: string, inputs: PutVectorInput[]): void {
+    if (this.readOnly) throw new ReadonlyError("putVectors");
     const entry = this.getEntry(indexName);
+    entry.sortedKeysCache = null;
     const keys: string[] = [];
 
     for (const input of inputs) {
@@ -145,6 +153,7 @@ export class VectorStore {
     if (!entry) return;
 
     entry.vectors.set(key, { key, metadata, sparseVector });
+    entry.sortedKeysCache = null;
     if (vector && !skipHNSW) entry.hnsw.insert(key, vector, metadata);
     if (sparseVector && entry.sparse) entry.sparse.insert(key, sparseVector);
   }
@@ -178,7 +187,9 @@ export class VectorStore {
   }
 
   deleteVectors(indexName: string, keys: string[]): number {
+    if (this.readOnly) throw new ReadonlyError("deleteVectors");
     const entry = this.getEntry(indexName);
+    entry.sortedKeysCache = null;
     let deleted = 0;
 
     for (const key of keys) {
@@ -201,6 +212,7 @@ export class VectorStore {
     const entry = this.indexes.get(indexName);
     if (!entry) return;
     entry.vectors.delete(key);
+    entry.sortedKeysCache = null;
     entry.hnsw.remove(key);
     entry.sparse?.remove(key);
   }
@@ -211,9 +223,10 @@ export class VectorStore {
     const maxKeys = opts?.maxKeys ?? 1000;
     const startAfter = opts?.startAfter;
 
-    let keys = [...entry.vectors.keys()]
-      .filter(k => k.startsWith(prefix))
-      .sort();
+    if (!entry.sortedKeysCache) {
+      entry.sortedKeysCache = [...entry.vectors.keys()].sort();
+    }
+    let keys = entry.sortedKeysCache.filter(k => k.startsWith(prefix));
 
     if (startAfter) {
       keys = keys.filter(k => k > startAfter);
@@ -282,11 +295,12 @@ export class VectorStore {
     const efSearch = opts.efSearch ?? 64;
     const denseResults = entry.hnsw.search(query, fetchK, efSearch, opts.filter);
 
-    // Sparse search
+    // Sparse search — reduce fetch if dense returned fewer than topK
+    const sparseFetchK = denseResults.length < opts.topK ? opts.topK : fetchK;
     const filterFn = opts.filter
       ? (key: string) => matchesFilter(entry.vectors.get(key)?.metadata, opts.filter!)
       : undefined;
-    const sparseResults = entry.sparse.search(opts.sparseVector!, fetchK, filterFn);
+    const sparseResults = entry.sparse.search(opts.sparseVector!, sparseFetchK, filterFn);
 
     // RRF fusion
     const rrfScores = new Map<string, number>();
@@ -358,6 +372,7 @@ export class VectorStore {
   // === Lifecycle ===
 
   checkpoint(): void {
+    if (this.readOnly) throw new ReadonlyError("checkpoint");
     this.wal?.checkpoint(this);
   }
 

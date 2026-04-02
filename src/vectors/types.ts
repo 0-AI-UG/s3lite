@@ -130,6 +130,8 @@ export type VectorEventCallback = (indexName: string, keys?: string[]) => void;
 export interface VectorClientOptions {
   path?: string;
   syncMode?: "full" | "normal" | "off";
+  /** Open in read-only mode. No file lock is acquired and all write operations throw. */
+  readonly?: boolean;
 }
 
 // === HNSW Internal Types ===
