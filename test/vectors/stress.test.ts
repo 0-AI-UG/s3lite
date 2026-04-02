@@ -113,7 +113,7 @@ test("stress: 10k vectors, 768d (sentence-transformer size)", () => {
   const queryTime = performance.now() - qStart;
 
   console.log(`[vectors 10k x 768d] insert: ${insertTime.toFixed(0)}ms, 50 queries: ${queryTime.toFixed(0)}ms (${(queryTime / 50).toFixed(2)}ms/query)`);
-}, 300_000);
+});
 
 test("stress: 50k vectors, 128d", () => {
   client = new VectorClient();
@@ -152,7 +152,7 @@ test("stress: 50k vectors, 128d", () => {
   expect(totalKeys).toBe(count);
 
   console.log(`[vectors 50k x 128d] insert: ${insertTime.toFixed(0)}ms, 50 queries: ${queryTime.toFixed(0)}ms (${(queryTime / 50).toFixed(2)}ms/query)`);
-}, 600_000);
+});
 
 test("stress: 1k vectors with metadata filtering", () => {
   client = new VectorClient();
