@@ -27,7 +27,7 @@ function normalizedVector(dim: number): number[] {
   return v.map((x) => x / norm);
 }
 
-test("stress: 1k vectors, 128d, cosine", { timeout: 30_000 }, () => {
+test("stress: 1k vectors, 128d, cosine", () => {
   client = new VectorClient();
   const dim = 128;
   const count = 1_000;
@@ -55,7 +55,7 @@ test("stress: 1k vectors, 128d, cosine", { timeout: 30_000 }, () => {
   console.log(`[vectors 1k x 128d] insert: ${insertTime.toFixed(0)}ms, query top-10: ${queryTime.toFixed(2)}ms`);
 });
 
-test("stress: 10k vectors, 128d, cosine", { timeout: 60_000 }, () => {
+test("stress: 10k vectors, 128d, cosine", () => {
   client = new VectorClient();
   const dim = 128;
   const count = 10_000;
@@ -87,7 +87,7 @@ test("stress: 10k vectors, 128d, cosine", { timeout: 60_000 }, () => {
   console.log(`[vectors 10k x 128d] insert: ${insertTime.toFixed(0)}ms, ${numQueries} queries: ${queryTime.toFixed(0)}ms (${(queryTime / numQueries).toFixed(2)}ms/query)`);
 });
 
-test("stress: 10k vectors, 768d (sentence-transformer size)", { timeout: 300_000 }, () => {
+test("stress: 10k vectors, 768d (sentence-transformer size)", () => {
   client = new VectorClient();
   const dim = 768;
   const count = 10_000;
@@ -113,9 +113,9 @@ test("stress: 10k vectors, 768d (sentence-transformer size)", { timeout: 300_000
   const queryTime = performance.now() - qStart;
 
   console.log(`[vectors 10k x 768d] insert: ${insertTime.toFixed(0)}ms, 50 queries: ${queryTime.toFixed(0)}ms (${(queryTime / 50).toFixed(2)}ms/query)`);
-});
+}, 300_000);
 
-test("stress: 50k vectors, 128d", { timeout: 600_000 }, () => {
+test("stress: 50k vectors, 128d", () => {
   client = new VectorClient();
   const dim = 128;
   const count = 50_000;
@@ -152,9 +152,9 @@ test("stress: 50k vectors, 128d", { timeout: 600_000 }, () => {
   expect(totalKeys).toBe(count);
 
   console.log(`[vectors 50k x 128d] insert: ${insertTime.toFixed(0)}ms, 50 queries: ${queryTime.toFixed(0)}ms (${(queryTime / 50).toFixed(2)}ms/query)`);
-});
+}, 600_000);
 
-test("stress: 1k vectors with metadata filtering", { timeout: 30_000 }, () => {
+test("stress: 1k vectors with metadata filtering", () => {
   client = new VectorClient();
   const dim = 128;
   const count = 1_000;
@@ -189,7 +189,7 @@ test("stress: 1k vectors with metadata filtering", { timeout: 30_000 }, () => {
   console.log(`[vectors 1k filtered] query: ${queryTime.toFixed(2)}ms, results: ${results.length}`);
 });
 
-test("stress: vector persistence with 5k vectors", { timeout: 60_000 }, () => {
+test("stress: vector persistence with 5k vectors", () => {
   client = new VectorClient({ path: TEST_PATH });
   const dim = 64;
   const count = 5_000;
@@ -235,7 +235,7 @@ test("stress: vector persistence with 5k vectors", { timeout: 60_000 }, () => {
   console.log(`[vectors 5k persisted] insert: ${insertTime.toFixed(0)}ms, reopen+list: ${reopenTime.toFixed(0)}ms`);
 });
 
-test("stress: hybrid query with 5k vectors", { timeout: 60_000 }, () => {
+test("stress: hybrid query with 5k vectors", () => {
   client = new VectorClient();
   const dim = 128;
   const count = 5_000;
@@ -276,7 +276,7 @@ test("stress: hybrid query with 5k vectors", { timeout: 60_000 }, () => {
   console.log(`[vectors 5k hybrid] insert: ${insertTime.toFixed(0)}ms, 20 queries: ${queryTime.toFixed(0)}ms (${(queryTime / 20).toFixed(2)}ms/query)`);
 });
 
-test("stress: delete and re-insert cycle", { timeout: 60_000 }, () => {
+test("stress: delete and re-insert cycle", () => {
   client = new VectorClient();
   const dim = 64;
   const count = 2_000;

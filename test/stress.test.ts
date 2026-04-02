@@ -30,7 +30,7 @@ test("stress: 10k objects in-memory", async () => {
   let token: string | undefined;
   do {
     const page = client.list({ prefix: "file-", maxKeys: 10_000, continuationToken: token });
-    total += page.contents.length;
+    total += page.contents!.length;
     token = page.nextContinuationToken;
   } while (token);
   expect(total).toBe(count);
@@ -83,7 +83,7 @@ test("stress: 100k objects in-memory", async () => {
   const writeTime = performance.now() - start;
 
   const listed = client.list({ prefix: "obj-", maxKeys: 1 });
-  expect(listed.contents.length).toBe(1);
+  expect(listed.contents!.length).toBe(1);
   expect(listed.isTruncated).toBe(true);
 
   // Random reads
@@ -190,7 +190,7 @@ test("stress: list performance with many keys", async () => {
   const result = client.list({ prefix: "dir/sub/", maxKeys: 1000 });
   const listTime = performance.now() - start;
 
-  expect(result.contents.length).toBe(1000);
+  expect(result.contents!.length).toBe(1000);
   expect(result.isTruncated).toBe(true);
 
   // Paginate through all
@@ -199,7 +199,7 @@ test("stress: list performance with many keys", async () => {
   const fullStart = performance.now();
   do {
     const page = client.list({ prefix: "dir/sub/", maxKeys: 10_000, continuationToken: token });
-    total += page.contents.length;
+    total += page.contents!.length;
     token = page.nextContinuationToken;
   } while (token);
   const fullListTime = performance.now() - fullStart;
