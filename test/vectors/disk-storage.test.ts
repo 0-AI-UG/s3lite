@@ -201,6 +201,7 @@ describe("disk storage", () => {
     console.log(`[disk 1k x 128d] insert: ${insertTime.toFixed(0)}ms, 50 queries: ${queryTime.toFixed(0)}ms (${(queryTime / 50).toFixed(2)}ms/query)`);
   });
 
+  // @ts-expect-error bun test timeout option
   test("5k vectors disk mode with persistence", { timeout: 30_000 }, () => {
     client = new VectorClient({ path: TEST_PATH, storage: "disk" });
     const dim = 128;
