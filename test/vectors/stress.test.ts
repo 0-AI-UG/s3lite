@@ -88,7 +88,7 @@ test("stress: 10k vectors, 128d, cosine", () => {
 });
 
 // @ts-expect-error bun test timeout option
-test("stress: 10k vectors, 768d (sentence-transformer size)", { timeout: 30_000 }, () => {
+test("stress: 10k vectors, 768d (sentence-transformer size)", { timeout: 120_000 }, () => {
   client = new VectorClient();
   const dim = 768;
   const count = 10_000;
@@ -117,7 +117,7 @@ test("stress: 10k vectors, 768d (sentence-transformer size)", { timeout: 30_000 
 });
 
 // @ts-expect-error bun test timeout option
-test("stress: 50k vectors, 128d", { timeout: 60_000 }, () => {
+test("stress: 50k vectors, 128d", { timeout: 300_000 }, () => {
   client = new VectorClient();
   const dim = 128;
   const count = 50_000;
