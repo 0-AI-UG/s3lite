@@ -117,7 +117,6 @@ export class PresignHandler {
         });
       }
 
-      const data = await file.bytes();
       const stat = file.stat();
       const headers: Record<string, string> = {
         ...this.corsHeaders,
@@ -134,26 +133,27 @@ export class PresignHandler {
         const match = rangeHeader.match(/^bytes=(\d+)-(\d*)$/);
         if (match) {
           const start = parseInt(match[1]!, 10);
-          const end = match[2] ? parseInt(match[2], 10) : data.byteLength - 1;
-          const clampedEnd = Math.min(end, data.byteLength - 1);
-          if (start > clampedEnd || start >= data.byteLength) {
+          const end = match[2] ? parseInt(match[2], 10) : stat.size - 1;
+          const clampedEnd = Math.min(end, stat.size - 1);
+          if (start > clampedEnd || start >= stat.size) {
             return new Response("Range Not Satisfiable", {
               status: 416,
               headers: {
                 ...this.corsHeaders,
-                "Content-Range": `bytes */${data.byteLength}`,
+                "Content-Range": `bytes */${stat.size}`,
               },
             });
           }
-          const slice = data.slice(start, clampedEnd + 1);
-          headers["Content-Range"] = `bytes ${start}-${clampedEnd}/${data.byteLength}`;
-          headers["Content-Length"] = String(slice.byteLength);
-          return new Response(slice, { status: 206, headers });
+          const sliceData = await file.slice(start, clampedEnd + 1).bytes();
+          headers["Content-Range"] = `bytes ${start}-${clampedEnd}/${stat.size}`;
+          headers["Content-Length"] = String(sliceData.byteLength);
+          return new Response(sliceData, { status: 206, headers });
         }
       }
 
       headers["Content-Length"] = String(stat.size);
-      return new Response(data, { headers });
+      const stream = file.readStream();
+      return new Response(stream, { headers });
     }
 
     if (req.method === "PUT") {

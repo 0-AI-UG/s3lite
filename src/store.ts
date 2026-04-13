@@ -273,6 +273,79 @@ export class Store {
     return obj.data.slice(start, end);
   }
 
+  getReadStream(bucket: string, key: string, chunkSize?: number): ReadableStream<Uint8Array> | undefined {
+    const obj = this.getObject(bucket, key);
+    if (!obj) return undefined;
+
+    if (this.blobLog && obj.blobOffset !== undefined && obj.blobLength !== undefined) {
+      return this.blobLog.createReadStream(obj.blobOffset, obj.blobLength, chunkSize);
+    }
+
+    // In-memory: wrap data in a single-chunk stream
+    const data = obj.data;
+    if (!data) return undefined;
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(data);
+        controller.close();
+      },
+    });
+  }
+
+  async putStream(
+    bucket: string,
+    key: string,
+    stream: ReadableStream<Uint8Array>,
+    contentType?: string,
+    contentDisposition?: string,
+    expires?: number,
+  ): Promise<{ size: number; etag: string }> {
+    if (this.readOnly) throw new ReadonlyError("put");
+    if (!this.blobLog) throw new Error("putStream requires blob storage (file-backed store)");
+
+    const resolvedType = contentType ?? guessMimeType(key);
+    const lastModified = new Date();
+    const expiresAt = expires ? Date.now() + expires * 1000 : undefined;
+
+    // Mark old blob data as dead if overwriting
+    const existing = this.indexGet(bucket, key);
+    if (existing?.blobLength) this.blobLog.markDead(existing.blobLength);
+
+    const { offset, length, etag } = await this.blobLog.appendStream(stream);
+
+    const metadata: Record<string, unknown> = {
+      contentType: resolvedType,
+      etag,
+      lastModified: lastModified.toISOString(),
+      blobOffset: offset,
+      blobLength: length,
+    };
+    if (contentDisposition) metadata.contentDisposition = contentDisposition;
+    if (expiresAt) metadata.expiresAt = expiresAt;
+
+    this.wal!.appendPut(bucket, key, null, metadata);
+    this.indexSet(bucket, key, {
+      data: null, size: length, etag, contentType: resolvedType,
+      lastModified, contentDisposition, expiresAt, blobOffset: offset, blobLength: length,
+    });
+
+    if (!this.inTransaction) {
+      if (this.blobLog.shouldCompact()) {
+        this.compactAndCheckpoint();
+      } else if (this.wal!.shouldCheckpoint() || (this.diskIdx && this.diskIdx.shouldCompactOverlay())) {
+        if (this.diskIdx) {
+          this.wal!.checkpointFromIterator(this.diskIdx.entries(), true);
+          this.diskIdx.reopen();
+        } else {
+          this.wal!.incrementalCheckpoint();
+        }
+      }
+    }
+
+    this.emit("put", bucket, key);
+    return { size: length, etag };
+  }
+
   delete(bucket: string, key: string): boolean {
     if (this.readOnly) throw new ReadonlyError("delete");
     const obj = this.indexGet(bucket, key);

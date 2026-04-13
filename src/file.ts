@@ -112,6 +112,23 @@ export class S3File extends Blob {
     return bytes.byteLength;
   }
 
+  readStream(chunkSize?: number): ReadableStream<Uint8Array> {
+    const stream = this.store.getReadStream(this.bucket, this.name, chunkSize);
+    if (!stream) throw new Error(`S3File not found: ${this.bucket}/${this.name}`);
+    return stream;
+  }
+
+  async writeStream(
+    stream: ReadableStream<Uint8Array>,
+    options?: S3Options,
+  ): Promise<number> {
+    const contentType = options?.type ?? this.opts.type;
+    const contentDisposition = options?.contentDisposition ?? this.opts.contentDisposition;
+    const expires = options?.expires ?? this.opts.expires;
+    const result = await this.store.putStream(this.bucket, this.name, stream, contentType, contentDisposition, expires);
+    return result.size;
+  }
+
   exists(): boolean {
     return this.store.exists(this.bucket, this.name);
   }

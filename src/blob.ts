@@ -8,8 +8,10 @@ import {
   renameSync,
   fstatSync,
   fsyncSync,
+  ftruncateSync,
 } from "node:fs";
 import { writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { ReadonlyError } from "./types";
 
 type SyncMode = "full" | "normal" | "off";
@@ -129,6 +131,74 @@ export class BlobLog {
     this.deadBytes = 0;
 
     return offsetMap;
+  }
+
+  /** Returns the current file descriptor (may change after compaction). */
+  get activeFd(): number {
+    return this.fd;
+  }
+
+  createReadStream(offset: number, length: number, chunkSize = 65536): ReadableStream<Uint8Array> {
+    if (this.fd === -1) throw new Error("Object has no data and no blob reference");
+    const blob = this;
+    let bytesRead = 0;
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        try {
+          const remaining = length - bytesRead;
+          if (remaining <= 0) {
+            controller.close();
+            return;
+          }
+          const toRead = Math.min(chunkSize, remaining);
+          const buf = Buffer.alloc(toRead);
+          readSync(blob.activeFd, buf, 0, toRead, offset + bytesRead);
+          bytesRead += toRead;
+          controller.enqueue(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+          if (bytesRead >= length) controller.close();
+        } catch (err) {
+          controller.error(err);
+        }
+      },
+    });
+  }
+
+  appendStream(stream: ReadableStream<Uint8Array>): Promise<{ offset: number; length: number; etag: string }> {
+    if (this.readOnly) throw new ReadonlyError("write");
+    const fd = this.fd;
+    const startOffset = this.currentSize;
+    let written = 0;
+    const hash = createHash("md5");
+    const syncMode = this.syncMode;
+    const self = this;
+
+    return (async () => {
+      const reader = stream.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value.byteLength === 0) continue;
+          try {
+            writeSync(fd, value, 0, value.byteLength, startOffset + written);
+          } catch (err) {
+            // Truncate back to last successful write to avoid orphaned partial data
+            try { ftruncateSync(fd, startOffset + written); } catch {}
+            self.currentSize = startOffset + written;
+            throw err;
+          }
+          hash.update(value);
+          written += value.byteLength;
+          self.currentSize = startOffset + written;
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      if (syncMode === "full") {
+        fsyncSync(fd);
+      }
+      return { offset: startOffset, length: written, etag: `"${hash.digest("hex")}"` };
+    })();
   }
 
   close(): void {
