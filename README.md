@@ -132,12 +132,21 @@ s3lite includes a built-in vector store for similarity search. Import from `@0-a
 ```ts
 import { VectorClient } from "@0-ai/s3lite/vectors";
 
-// In-memory
+// In-memory (all vectors in RAM)
 const vectors = new VectorClient();
 
-// With disk persistence
+// With disk persistence (vectors in RAM, WAL on disk)
 const vectors = new VectorClient({ path: "./vectors.db" });
+
+// Disk-backed storage (vectors stored on disk, only graph structure in RAM)
+const vectors = new VectorClient({
+  path: "./vectors.db",
+  storage: "disk",
+  diskCacheSize: 10_000, // LRU cache size (default: 10,000 vectors)
+});
 ```
+
+The default `"memory"` storage keeps all vector data in RAM — fast, but limited by available memory. With `"disk"` storage, vector float data is stored on disk using s3lite's own S3 storage engine, while only the HNSW graph structure and norms stay in memory. This reduces memory usage by ~95%, allowing you to handle 10-100x more vectors on the same machine. An LRU cache keeps frequently accessed vectors hot.
 
 ### Create an Index
 

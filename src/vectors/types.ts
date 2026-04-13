@@ -132,12 +132,16 @@ export interface VectorClientOptions {
   syncMode?: "full" | "normal" | "off";
   /** Open in read-only mode. No file lock is acquired and all write operations throw. */
   readonly?: boolean;
+  /** Storage mode: "memory" keeps all vectors in RAM (default), "disk" stores vector data in an internal S3 Store. */
+  storage?: "memory" | "disk";
+  /** Number of vectors to keep in the LRU cache when using disk storage. Default: 10000. */
+  diskCacheSize?: number;
 }
 
 // === HNSW Internal Types ===
 export interface HNSWNode {
   key: string;
-  vector: Float32Array;
+  vector: Float32Array | null;
   norm: number;
   metadata?: Record<string, unknown>;
   layer: number;

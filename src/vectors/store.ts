@@ -19,7 +19,10 @@ import { HNSWIndex } from "./hnsw";
 import { SparseIndex } from "./sparse";
 import { matchesFilter } from "./filter";
 import { VectorWAL } from "./wal";
+import { computeNorm } from "./distance";
 import { ReadonlyError } from "../types";
+import { Store } from "../store";
+import { VectorCache } from "./vector-cache";
 
 interface IndexEntry {
   config: VectorIndexConfig;
@@ -34,13 +37,56 @@ export class VectorStore {
   private wal: VectorWAL | null = null;
   private listeners: Map<VectorEventType, Set<VectorEventCallback>> = new Map();
   private readOnly: boolean;
+  private diskMode: boolean;
+  private s3Store: Store | null = null;
+  private vectorCache: VectorCache | null = null;
 
-  constructor(path?: string, syncMode: "full" | "normal" | "off" = "normal", readOnly = false) {
+  constructor(path?: string, syncMode: "full" | "normal" | "off" = "normal", readOnly = false, storage: "memory" | "disk" = "memory", diskCacheSize = 10_000) {
     this.readOnly = readOnly;
-    if (path) {
-      this.wal = new VectorWAL(path, syncMode, undefined, readOnly);
-      this.wal.open(this);
+    this.diskMode = storage === "disk";
+
+    if (this.diskMode) {
+      if (!path) throw new Error("storage: 'disk' requires a path");
+      this.s3Store = new Store(path + "-vdata", syncMode, "memory", readOnly);
+      this.vectorCache = new VectorCache(diskCacheSize);
     }
+
+    if (path) {
+      this.wal = new VectorWAL(path, syncMode, undefined, readOnly, this.diskMode, this.s3Store);
+      this.wal.open(this);
+
+      // In disk mode, set up vector providers for all indexes loaded during WAL replay
+      if (this.diskMode) {
+        for (const [indexName, entry] of this.indexes) {
+          this.setupVectorProvider(indexName, entry);
+        }
+      }
+    }
+  }
+
+  /** Set up a disk-backed vector provider for an HNSW index. */
+  private setupVectorProvider(indexName: string, entry: IndexEntry): void {
+    entry.hnsw.setVectorProvider((id: number) => {
+      const node = entry.hnsw.getNodeById(id);
+      if (!node) throw new Error(`Node ${id} not found`);
+      // If vector is still in memory (e.g. during insert), use it
+      if (node.vector) return node.vector;
+      return this.getVectorFromDisk(indexName, node.key);
+    });
+  }
+
+  /** Read a vector from LRU cache or S3 Store. */
+  private getVectorFromDisk(indexName: string, key: string): Float32Array {
+    // Check cache
+    const cached = this.vectorCache!.get(indexName, key);
+    if (cached) return cached;
+
+    // Read from S3 Store
+    const obj = this.s3Store!.get(indexName, key);
+    if (!obj?.data) throw new Error(`Vector data not found in store: ${indexName}/${key}`);
+    const vec = new Float32Array(obj.data.buffer, obj.data.byteOffset, obj.data.byteLength / 4);
+    this.vectorCache!.set(indexName, key, vec);
+    return vec;
   }
 
   // === Index Operations ===
@@ -68,7 +114,9 @@ export class VectorStore {
     const hnsw = new HNSWIndex(opts.dimension, distanceMetric, M, efConstruction);
     const sparseIdx = sparse ? new SparseIndex() : null;
 
-    this.indexes.set(opts.name, { config, hnsw, sparse: sparseIdx, vectors: new Map(), sortedKeysCache: null });
+    const entry: IndexEntry = { config, hnsw, sparse: sparseIdx, vectors: new Map(), sortedKeysCache: null };
+    this.indexes.set(opts.name, entry);
+    if (this.diskMode) this.setupVectorProvider(opts.name, entry);
     this.wal?.appendCreateIndex(config);
     this.emit("createIndex", opts.name);
     return config;
@@ -79,7 +127,9 @@ export class VectorStore {
     if (this.indexes.has(config.name)) return;
     const hnsw = new HNSWIndex(config.dimension, config.distanceMetric, config.hnswConfig.M, config.hnswConfig.efConstruction);
     const sparseIdx = config.sparse ? new SparseIndex() : null;
-    this.indexes.set(config.name, { config, hnsw, sparse: sparseIdx, vectors: new Map(), sortedKeysCache: null });
+    const entry: IndexEntry = { config, hnsw, sparse: sparseIdx, vectors: new Map(), sortedKeysCache: null };
+    this.indexes.set(config.name, entry);
+    if (this.diskMode) this.setupVectorProvider(config.name, entry);
   }
 
   // Internal: delete index without WAL (used during replay)
@@ -130,8 +180,22 @@ export class VectorStore {
         sparseVector: input.sparseVector,
       });
 
-      // Insert into HNSW
-      if (vector) {
+      let norm: number | undefined;
+
+      if (this.diskMode && vector) {
+        // Disk mode: write vector to S3 Store first
+        const data = new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength);
+        this.s3Store!.put(indexName, input.key, data);
+        norm = computeNorm(vector);
+
+        // Insert into HNSW (needs vector temporarily for graph construction)
+        entry.hnsw.insert(input.key, vector, input.metadata);
+        // Null out in-memory vector, it's on disk now
+        entry.hnsw.clearNodeVector(input.key);
+        // Cache it (likely to be queried soon)
+        this.vectorCache!.set(indexName, input.key, vector);
+      } else if (vector) {
+        // Memory mode: insert into HNSW as before
         entry.hnsw.insert(input.key, vector, input.metadata);
       }
 
@@ -140,7 +204,7 @@ export class VectorStore {
         entry.sparse.insert(input.key, input.sparseVector);
       }
 
-      this.wal?.appendPutVector(indexName, input.key, vector ?? null, input.metadata, input.sparseVector);
+      this.wal?.appendPutVector(indexName, input.key, vector ?? null, input.metadata, input.sparseVector, norm);
       keys.push(input.key);
     }
 
@@ -154,7 +218,14 @@ export class VectorStore {
 
     entry.vectors.set(key, { key, metadata, sparseVector });
     entry.sortedKeysCache = null;
-    if (vector && !skipHNSW) entry.hnsw.insert(key, vector, metadata);
+
+    if (vector && !skipHNSW) {
+      entry.hnsw.insert(key, vector, metadata);
+      // In disk mode, clear the in-memory vector after HNSW insertion
+      if (this.diskMode) {
+        entry.hnsw.clearNodeVector(key);
+      }
+    }
     if (sparseVector && entry.sparse) entry.sparse.insert(key, sparseVector);
   }
 
@@ -163,6 +234,7 @@ export class VectorStore {
     const entry = this.indexes.get(indexName);
     if (!entry) return;
     entry.hnsw = hnsw;
+    if (this.diskMode) this.setupVectorProvider(indexName, entry);
   }
 
   getVectors(indexName: string, keys: string[]): GetVectorResponse[] {
@@ -173,10 +245,21 @@ export class VectorStore {
       const meta = entry.vectors.get(key);
       if (!meta) continue;
 
-      const node = entry.hnsw.getNode(key);
+      let vector: Float32Array | undefined;
+      if (this.diskMode) {
+        try {
+          vector = this.getVectorFromDisk(indexName, key);
+        } catch {
+          // Vector may not have dense data (sparse-only)
+        }
+      } else {
+        const node = entry.hnsw.getNode(key);
+        vector = node?.vector ?? undefined;
+      }
+
       const response: GetVectorResponse = {
         key,
-        vector: node?.vector,
+        vector,
         metadata: meta.metadata,
         sparseVector: meta.sparseVector,
       };
@@ -196,6 +279,10 @@ export class VectorStore {
       if (entry.vectors.delete(key)) {
         entry.hnsw.remove(key);
         entry.sparse?.remove(key);
+        if (this.diskMode) {
+          this.vectorCache!.delete(indexName, key);
+          this.s3Store!.delete(indexName, key);
+        }
         this.wal?.appendDeleteVector(indexName, key);
         deleted++;
       }
@@ -215,6 +302,9 @@ export class VectorStore {
     entry.sortedKeysCache = null;
     entry.hnsw.remove(key);
     entry.sparse?.remove(key);
+    if (this.diskMode) {
+      this.vectorCache!.delete(indexName, key);
+    }
   }
 
   listVectors(indexName: string, opts?: ListVectorsOptions): ListVectorsResponse {
@@ -334,8 +424,14 @@ export class VectorStore {
         result.metadata = entry.vectors.get(s.key)?.metadata;
       }
       if (includeVectors) {
-        const node = entry.hnsw.getNode(s.key);
-        if (node) result.vector = node.vector;
+        if (this.diskMode) {
+          try {
+            result.vector = this.getVectorFromDisk(entry.config.name, s.key);
+          } catch { /* sparse-only vector */ }
+        } else {
+          const node = entry.hnsw.getNode(s.key);
+          if (node?.vector) result.vector = node.vector;
+        }
         if (entry.sparse) {
           result.sparseVector = entry.vectors.get(s.key)?.sparseVector;
         }
@@ -378,6 +474,9 @@ export class VectorStore {
 
   close(): void {
     this.wal?.close(this);
+    if (this.s3Store) {
+      this.s3Store.close();
+    }
   }
 
   // === Helpers ===

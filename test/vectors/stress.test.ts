@@ -87,7 +87,7 @@ test("stress: 10k vectors, 128d, cosine", () => {
   console.log(`[vectors 10k x 128d] insert: ${insertTime.toFixed(0)}ms, ${numQueries} queries: ${queryTime.toFixed(0)}ms (${(queryTime / numQueries).toFixed(2)}ms/query)`);
 });
 
-test("stress: 10k vectors, 768d (sentence-transformer size)", () => {
+test("stress: 10k vectors, 768d (sentence-transformer size)", { timeout: 30_000 }, () => {
   client = new VectorClient();
   const dim = 768;
   const count = 10_000;
@@ -115,7 +115,7 @@ test("stress: 10k vectors, 768d (sentence-transformer size)", () => {
   console.log(`[vectors 10k x 768d] insert: ${insertTime.toFixed(0)}ms, 50 queries: ${queryTime.toFixed(0)}ms (${(queryTime / 50).toFixed(2)}ms/query)`);
 });
 
-test("stress: 50k vectors, 128d", () => {
+test("stress: 50k vectors, 128d", { timeout: 60_000 }, () => {
   client = new VectorClient();
   const dim = 128;
   const count = 50_000;

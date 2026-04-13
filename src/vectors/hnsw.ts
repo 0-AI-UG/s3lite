@@ -5,7 +5,7 @@ import { matchesFilter } from "./filter";
 // Internal node — uses numeric IDs for neighbors instead of string Sets
 interface INode {
   key: string;
-  vector: Float32Array;
+  vector: Float32Array | null; // null when disk-backed (vectors stored externally)
   norm: number;
   metadata?: Record<string, unknown>;
   layer: number;
@@ -156,6 +156,9 @@ export class HNSWIndex {
   private mL: number;
   private distFn: (a: Float32Array, b: Float32Array, normA?: number, normB?: number) => number;
 
+  // Pluggable vector access — memory mode reads from INode.vector, disk mode reads from external store
+  private getVec: (id: number) => Float32Array;
+
   constructor(dimension: number, metric: DistanceMetric = "cosine", M = 16, efConstruction = 200) {
     this.dimension = dimension;
     this.metric = metric;
@@ -164,6 +167,23 @@ export class HNSWIndex {
     this.efConstruction = efConstruction;
     this.mL = 1 / Math.log(M);
     this.distFn = getDistanceFn(metric);
+    this.getVec = (id) => this.nodes[id]!.vector!;
+  }
+
+  setVectorProvider(provider: (id: number) => Float32Array): void {
+    this.getVec = provider;
+  }
+
+  getNodeById(id: number): INode | undefined {
+    return this.nodes[id];
+  }
+
+  /** Null out the in-memory vector for a node (used after writing to disk). */
+  clearNodeVector(key: string): void {
+    const id = this.keyToId.get(key);
+    if (id !== undefined && this.nodes[id]) {
+      this.nodes[id]!.vector = null;
+    }
   }
 
   get size(): number { return this.activeCount; }
@@ -204,18 +224,31 @@ export class HNSWIndex {
     return Math.min(raw, maxAllowed);
   }
 
+  hasKey(key: string): boolean {
+    return this.keyToId.has(key);
+  }
+
   getNode(key: string): HNSWNode | undefined {
     const id = this.keyToId.get(key);
     if (id === undefined) return undefined;
     const n = this.nodes[id];
     if (!n) return undefined;
     return {
-      key: n.key, vector: n.vector, norm: n.norm, metadata: n.metadata,
+      key: n.key, vector: n.vector ?? this.getVec(id), norm: n.norm, metadata: n.metadata,
       layer: n.layer, deleted: false,
       neighbors: n.neighbors.map(layer =>
-        new Set(layer.map(nId => this.nodes[nId]!.key)),
+        new Set(layer.filter(nId => this.nodes[nId] !== undefined).map(nId => this.nodes[nId]!.key)),
       ),
     };
+  }
+
+  /** Iterate nodes yielding only metadata (no vector access). Used for disk-mode checkpointing. */
+  *allNodeMeta(): IterableIterator<{ key: string; norm: number; metadata?: Record<string, unknown> }> {
+    for (let i = 0; i < this.nextId; i++) {
+      const n = this.nodes[i];
+      if (!n) continue;
+      yield { key: n.key, norm: n.norm, metadata: n.metadata };
+    }
   }
 
   *allNodes(): IterableIterator<HNSWNode> {
@@ -223,10 +256,10 @@ export class HNSWIndex {
       const n = this.nodes[i];
       if (!n) continue;
       yield {
-        key: n.key, vector: n.vector, norm: n.norm, metadata: n.metadata,
+        key: n.key, vector: n.vector ?? this.getVec(i), norm: n.norm, metadata: n.metadata,
         layer: n.layer, deleted: false,
         neighbors: n.neighbors.map(layer =>
-          new Set(layer.map(nId => this.nodes[nId]!.key)),
+          new Set(layer.filter(nId => this.nodes[nId] !== undefined).map(nId => this.nodes[nId]!.key)),
         ),
       };
     }
@@ -262,8 +295,9 @@ export class HNSWIndex {
 
     const distFn = this.distFn;
     const nodesArr = this.nodes;
+    const getVec = this.getVec;
     let currentId = this.entryPointId;
-    let currentDist = distFn(vector, nodesArr[currentId]!.vector, norm, nodesArr[currentId]!.norm);
+    let currentDist = distFn(vector, getVec(currentId), norm, nodesArr[currentId]!.norm);
 
     // Greedy descent through layers above insertion layer
     for (let lc = this._maxLayer; lc > layer; lc--) {
@@ -274,11 +308,12 @@ export class HNSWIndex {
         if (lc < cn.neighbors.length) {
           const nbrs = cn.neighbors[lc]!;
           for (let ni = 0, nLen = nbrs.length; ni < nLen; ni++) {
-            const nbrNode = nodesArr[nbrs[ni]!];
+            const nbrId = nbrs[ni]!;
+            const nbrNode = nodesArr[nbrId];
             if (!nbrNode) continue;
-            const d = distFn(vector, nbrNode.vector, norm, nbrNode.norm);
+            const d = distFn(vector, getVec(nbrId), norm, nbrNode.norm);
             if (d < currentDist) {
-              currentId = nbrs[ni]!;
+              currentId = nbrId;
               currentDist = d;
               changed = true;
             }
@@ -300,8 +335,7 @@ export class HNSWIndex {
       const visited = this.visitedMark;
 
       visited[currentId] = gen;
-      const epNode = nodesArr[currentId]!;
-      const epDist = distFn(vector, epNode.vector, norm, epNode.norm);
+      const epDist = distFn(vector, getVec(currentId), norm, nodesArr[currentId]!.norm);
       candidates.push(currentId, epDist);
       results.push(currentId, epDist);
 
@@ -323,7 +357,7 @@ export class HNSWIndex {
           const nbrNode = nodesArr[nbrId];
           if (!nbrNode) continue;
 
-          const d = distFn(vector, nbrNode.vector, norm, nbrNode.norm);
+          const d = distFn(vector, getVec(nbrId), norm, nbrNode.norm);
 
           if (d < results.s[0] || results.n < ef) {
             candidates.push(nbrId, d);
@@ -390,6 +424,7 @@ export class HNSWIndex {
 
     const distFn = this.distFn;
     const nodesArr = this.nodes;
+    const getVec = this.getVec;
 
     // candidates are already sorted ascending by score
     const selected: number[] = [];
@@ -402,11 +437,12 @@ export class HNSWIndex {
       const cNode = nodesArr[cId];
       if (!cNode) continue;
       const cScore = candidateScores[i]!;
+      const cVec = getVec(cId);
 
       // Keep if closer to query than to any already-selected neighbor
       let tooClose = false;
       for (let j = 0, sLen = selected.length; j < sLen; j++) {
-        if (distFn(cNode.vector, selVecs[j]!, cNode.norm, selNorms[j]!) < cScore) {
+        if (distFn(cVec, selVecs[j]!, cNode.norm, selNorms[j]!) < cScore) {
           tooClose = true;
           break;
         }
@@ -414,7 +450,7 @@ export class HNSWIndex {
 
       if (!tooClose) {
         selected.push(cId);
-        selVecs.push(cNode.vector);
+        selVecs.push(cVec);
         selNorms.push(cNode.norm);
       }
     }
@@ -438,13 +474,17 @@ export class HNSWIndex {
 
     const distFn = this.distFn;
     const nodesArr = this.nodes;
+    const getVec = this.getVec;
     const len = nbrs.length;
+    const nodeId = this.keyToId.get(node.key)!;
+    const nodeVec = getVec(nodeId);
 
     // Score all neighbors by distance, keep closest maxConn
     const scores: number[] = new Array(len);
     for (let i = 0; i < len; i++) {
-      const nNode = nodesArr[nbrs[i]!];
-      scores[i] = nNode ? distFn(node.vector, nNode.vector, node.norm, nNode.norm) : Infinity;
+      const nbrId = nbrs[i]!;
+      const nNode = nodesArr[nbrId];
+      scores[i] = nNode ? distFn(nodeVec, getVec(nbrId), node.norm, nNode.norm) : Infinity;
     }
 
     // Index sort by score ascending
@@ -515,8 +555,9 @@ export class HNSWIndex {
     const queryNorm = computeNorm(query);
     const distFn = this.distFn;
     const nodesArr = this.nodes;
+    const getVec = this.getVec;
     let currentId = this.entryPointId;
-    let currentDist = distFn(query, nodesArr[currentId]!.vector, queryNorm, nodesArr[currentId]!.norm);
+    let currentDist = distFn(query, getVec(currentId), queryNorm, nodesArr[currentId]!.norm);
 
     // Greedy descent through upper layers
     for (let lc = this._maxLayer; lc > 0; lc--) {
@@ -527,11 +568,12 @@ export class HNSWIndex {
         if (lc < cn.neighbors.length) {
           const nbrs = cn.neighbors[lc]!;
           for (let ni = 0, nLen = nbrs.length; ni < nLen; ni++) {
-            const nbrNode = nodesArr[nbrs[ni]!];
+            const nbrId = nbrs[ni]!;
+            const nbrNode = nodesArr[nbrId];
             if (!nbrNode) continue;
-            const d = distFn(query, nbrNode.vector, queryNorm, nbrNode.norm);
+            const d = distFn(query, getVec(nbrId), queryNorm, nbrNode.norm);
             if (d < currentDist) {
-              currentId = nbrs[ni]!;
+              currentId = nbrId;
               currentDist = d;
               changed = true;
             }
@@ -552,8 +594,7 @@ export class HNSWIndex {
     const visited = this.visitedMark;
     visited[currentId] = gen;
 
-    const epNode = nodesArr[currentId]!;
-    const epDist = distFn(query, epNode.vector, queryNorm, epNode.norm);
+    const epDist = distFn(query, getVec(currentId), queryNorm, nodesArr[currentId]!.norm);
     candidates.push(currentId, epDist);
     results.push(currentId, epDist);
 
@@ -575,7 +616,7 @@ export class HNSWIndex {
         const nbrNode = nodesArr[nbrId];
         if (!nbrNode) continue;
 
-        const d = distFn(query, nbrNode.vector, queryNorm, nbrNode.norm);
+        const d = distFn(query, getVec(nbrId), queryNorm, nbrNode.norm);
 
         if (d < results.s[0] || results.n < ef) {
           candidates.push(nbrId, d);
@@ -681,7 +722,7 @@ export class HNSWIndex {
   static deserialize(
     data: Uint8Array,
     offset: number,
-    nodesMap: Map<string, { vector: Float32Array; norm: number; metadata?: Record<string, unknown>; layer?: number }>,
+    nodesMap: Map<string, { vector: Float32Array | null; norm: number; metadata?: Record<string, unknown>; layer?: number }>,
     dimension: number,
     metric: DistanceMetric,
     M: number,
