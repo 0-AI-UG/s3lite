@@ -29,7 +29,6 @@ interface IndexEntry {
   hnsw: HNSWIndex;
   sparse: SparseIndex | null;
   vectors: Map<string, StoredVectorMeta>;
-  sortedKeysCache: string[] | null;
 }
 
 export class VectorStore {
@@ -41,14 +40,18 @@ export class VectorStore {
   private s3Store: Store | null = null;
   private vectorCache: VectorCache | null = null;
 
-  constructor(path?: string, syncMode: "full" | "normal" | "off" = "normal", readOnly = false, storage: "memory" | "disk" = "memory", diskCacheSize = 10_000) {
+  constructor(path?: string, syncMode: "full" | "normal" | "off" = "normal", readOnly = false, storage: "memory" | "disk" = "memory", diskCacheSize = 10_000, diskCacheBytes?: number) {
     this.readOnly = readOnly;
     this.diskMode = storage === "disk";
 
     if (this.diskMode) {
       if (!path) throw new Error("storage: 'disk' requires a path");
       this.s3Store = new Store(path + "-vdata", syncMode, "memory", readOnly);
-      this.vectorCache = new VectorCache(diskCacheSize);
+      this.vectorCache = new VectorCache(
+        diskCacheBytes !== undefined
+          ? { maxBytes: diskCacheBytes }
+          : { maxSize: diskCacheSize },
+      );
     }
 
     if (path) {
@@ -114,7 +117,7 @@ export class VectorStore {
     const hnsw = new HNSWIndex(opts.dimension, distanceMetric, M, efConstruction);
     const sparseIdx = sparse ? new SparseIndex() : null;
 
-    const entry: IndexEntry = { config, hnsw, sparse: sparseIdx, vectors: new Map(), sortedKeysCache: null };
+    const entry: IndexEntry = { config, hnsw, sparse: sparseIdx, vectors: new Map() };
     this.indexes.set(opts.name, entry);
     if (this.diskMode) this.setupVectorProvider(opts.name, entry);
     this.wal?.appendCreateIndex(config);
@@ -127,7 +130,7 @@ export class VectorStore {
     if (this.indexes.has(config.name)) return;
     const hnsw = new HNSWIndex(config.dimension, config.distanceMetric, config.hnswConfig.M, config.hnswConfig.efConstruction);
     const sparseIdx = config.sparse ? new SparseIndex() : null;
-    const entry: IndexEntry = { config, hnsw, sparse: sparseIdx, vectors: new Map(), sortedKeysCache: null };
+    const entry: IndexEntry = { config, hnsw, sparse: sparseIdx, vectors: new Map() };
     this.indexes.set(config.name, entry);
     if (this.diskMode) this.setupVectorProvider(config.name, entry);
   }
@@ -160,7 +163,6 @@ export class VectorStore {
   putVectors(indexName: string, inputs: PutVectorInput[]): void {
     if (this.readOnly) throw new ReadonlyError("putVectors");
     const entry = this.getEntry(indexName);
-    entry.sortedKeysCache = null;
     const keys: string[] = [];
 
     for (const input of inputs) {
@@ -217,7 +219,6 @@ export class VectorStore {
     if (!entry) return;
 
     entry.vectors.set(key, { key, metadata, sparseVector });
-    entry.sortedKeysCache = null;
 
     if (vector && !skipHNSW) {
       entry.hnsw.insert(key, vector, metadata);
@@ -272,7 +273,6 @@ export class VectorStore {
   deleteVectors(indexName: string, keys: string[]): number {
     if (this.readOnly) throw new ReadonlyError("deleteVectors");
     const entry = this.getEntry(indexName);
-    entry.sortedKeysCache = null;
     let deleted = 0;
 
     for (const key of keys) {
@@ -299,7 +299,6 @@ export class VectorStore {
     const entry = this.indexes.get(indexName);
     if (!entry) return;
     entry.vectors.delete(key);
-    entry.sortedKeysCache = null;
     entry.hnsw.remove(key);
     entry.sparse?.remove(key);
     if (this.diskMode) {
@@ -313,17 +312,18 @@ export class VectorStore {
     const maxKeys = opts?.maxKeys ?? 1000;
     const startAfter = opts?.startAfter;
 
-    if (!entry.sortedKeysCache) {
-      entry.sortedKeysCache = [...entry.vectors.keys()].sort();
+    // Stream matching keys in sorted order without caching the full list.
+    // Two-pass: collect only keys that match prefix/startAfter, then sort.
+    const matched: string[] = [];
+    for (const k of entry.vectors.keys()) {
+      if (prefix && !k.startsWith(prefix)) continue;
+      if (startAfter !== undefined && k <= startAfter) continue;
+      matched.push(k);
     }
-    let keys = entry.sortedKeysCache.filter(k => k.startsWith(prefix));
+    matched.sort();
 
-    if (startAfter) {
-      keys = keys.filter(k => k > startAfter);
-    }
-
-    const isTruncated = keys.length > maxKeys;
-    const truncated = keys.slice(0, maxKeys);
+    const isTruncated = matched.length > maxKeys;
+    const truncated = matched.slice(0, maxKeys);
 
     return {
       keys: truncated,

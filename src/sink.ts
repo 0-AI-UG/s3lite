@@ -1,19 +1,36 @@
 import type { S3Options } from "./types";
-import type { Store } from "./store";
-import { normalizeToBytes, concatUint8Arrays } from "./utils";
+import type { Store, StorePutSession } from "./store";
+import { concatUint8Arrays } from "./utils";
 
 export class NetworkSink {
   private store: Store;
   private bucket: string;
   private key: string;
   private opts: S3Options;
-  private chunks: Uint8Array[] = [];
+
+  // Streaming path: a sync session that writes each chunk straight to disk.
+  private session: StorePutSession | null = null;
+
+  // Buffered fallback for in-memory stores (which have no blob log).
+  private chunks: Uint8Array[] | null;
+
+  private bytesWritten = 0;
+  private readonly streaming: boolean;
 
   constructor(store: Store, bucket: string, key: string, opts: S3Options = {}) {
     this.store = store;
     this.bucket = bucket;
     this.key = key;
     this.opts = opts;
+    this.streaming = store.supportsStreaming;
+    this.chunks = this.streaming ? null : [];
+  }
+
+  private ensureSession(): StorePutSession {
+    if (!this.session) {
+      this.session = this.store.beginPutSync(this.bucket, this.key);
+    }
+    return this.session;
   }
 
   write(
@@ -29,7 +46,13 @@ export class NetworkSink {
     } else {
       bytes = new Uint8Array(chunk);
     }
-    this.chunks.push(bytes);
+
+    if (this.streaming) {
+      this.ensureSession().write(bytes);
+    } else {
+      this.chunks!.push(bytes);
+    }
+    this.bytesWritten += bytes.byteLength;
     return bytes.byteLength;
   }
 
@@ -38,7 +61,20 @@ export class NetworkSink {
   }
 
   async end(): Promise<number> {
-    const data = concatUint8Arrays(this.chunks);
+    if (this.streaming) {
+      const session = this.ensureSession();
+      const result = session.end({
+        contentType: this.opts.type,
+        contentDisposition: this.opts.contentDisposition,
+        expires: this.opts.expires,
+      });
+      this.session = null;
+      const written = this.bytesWritten;
+      this.bytesWritten = 0;
+      return result.size || written;
+    }
+
+    const data = concatUint8Arrays(this.chunks!);
     this.store.put(
       this.bucket,
       this.key,
@@ -49,10 +85,11 @@ export class NetworkSink {
     );
     const size = data.byteLength;
     this.chunks = [];
+    this.bytesWritten = 0;
     return size;
   }
 
-  start(options?: { highWaterMark?: number }): void {
+  start(_options?: { highWaterMark?: number }): void {
     // no-op
   }
 

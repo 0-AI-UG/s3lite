@@ -1,14 +1,24 @@
 /**
- * LRU cache for Float32Array vectors, using Map insertion-order semantics.
+ * LRU cache for Float32Array vectors with an optional byte budget.
+ * When `maxBytes` is set, eviction is driven by total bytes held.
+ * Otherwise, falls back to an entry-count limit (back-compat with `maxSize`).
  * Keyed by composite "indexName/key" string.
  */
 export class VectorCache {
   private cache: Map<string, Float32Array>;
   private maxSize: number;
+  private maxBytes: number;
+  private bytes = 0;
 
-  constructor(maxSize: number) {
+  constructor(opts: { maxSize?: number; maxBytes?: number } | number) {
     this.cache = new Map();
-    this.maxSize = maxSize;
+    if (typeof opts === "number") {
+      this.maxSize = opts;
+      this.maxBytes = 0;
+    } else {
+      this.maxSize = opts.maxSize ?? 0;
+      this.maxBytes = opts.maxBytes ?? 0;
+    }
   }
 
   private cacheKey(indexName: string, key: string): string {
@@ -27,20 +37,46 @@ export class VectorCache {
 
   set(indexName: string, key: string, vector: Float32Array): void {
     const ck = this.cacheKey(indexName, key);
+    const prev = this.cache.get(ck);
+    if (prev) this.bytes -= prev.byteLength;
     this.cache.delete(ck);
     this.cache.set(ck, vector);
-    if (this.cache.size > this.maxSize) {
-      // Evict oldest (first inserted)
-      const first = this.cache.keys().next().value;
-      if (first !== undefined) this.cache.delete(first);
+    this.bytes += vector.byteLength;
+    this.evict();
+  }
+
+  private evict(): void {
+    if (this.maxBytes > 0) {
+      while (this.bytes > this.maxBytes && this.cache.size > 1) {
+        const first = this.cache.keys().next().value;
+        if (first === undefined) break;
+        const v = this.cache.get(first);
+        this.cache.delete(first);
+        if (v) this.bytes -= v.byteLength;
+      }
+    }
+    if (this.maxSize > 0) {
+      while (this.cache.size > this.maxSize) {
+        const first = this.cache.keys().next().value;
+        if (first === undefined) break;
+        const v = this.cache.get(first);
+        this.cache.delete(first);
+        if (v) this.bytes -= v.byteLength;
+      }
     }
   }
 
   delete(indexName: string, key: string): void {
-    this.cache.delete(this.cacheKey(indexName, key));
+    const ck = this.cacheKey(indexName, key);
+    const v = this.cache.get(ck);
+    if (v) {
+      this.bytes -= v.byteLength;
+      this.cache.delete(ck);
+    }
   }
 
   clear(): void {
     this.cache.clear();
+    this.bytes = 0;
   }
 }

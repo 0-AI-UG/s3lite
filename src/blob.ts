@@ -163,6 +163,22 @@ export class BlobLog {
     });
   }
 
+  /**
+   * Begin a synchronous chunked append. Callers write chunks via the returned
+   * session as they arrive (no buffering), then call `finish()` to get the
+   * final offset/length/etag. This is the path used by NetworkSink so that a
+   * synchronous `write()` API still flushes each chunk to disk immediately.
+   */
+  beginAppendSync(): BlobAppendSession {
+    if (this.readOnly) throw new ReadonlyError("write");
+    return new BlobAppendSession(this, this.fd, this.currentSize, this.syncMode);
+  }
+
+  /** @internal */
+  _commitAppend(newSize: number): void {
+    this.currentSize = newSize;
+  }
+
   appendStream(stream: ReadableStream<Uint8Array>): Promise<{ offset: number; length: number; etag: string }> {
     if (this.readOnly) throw new ReadonlyError("write");
     const fd = this.fd;
@@ -203,5 +219,53 @@ export class BlobLog {
 
   close(): void {
     if (this.fd !== -1) closeSync(this.fd);
+  }
+}
+
+/**
+ * A synchronous chunked append session. Writes each chunk directly to the
+ * blob file descriptor as it arrives. Holds no buffered copies.
+ */
+export class BlobAppendSession {
+  private blob: BlobLog;
+  private fd: number;
+  private readonly startOffset: number;
+  private written = 0;
+  private hash = createHash("md5");
+  private syncMode: SyncMode;
+  private finished = false;
+
+  constructor(blob: BlobLog, fd: number, startOffset: number, syncMode: SyncMode) {
+    this.blob = blob;
+    this.fd = fd;
+    this.startOffset = startOffset;
+    this.syncMode = syncMode;
+  }
+
+  write(chunk: Uint8Array): void {
+    if (this.finished) throw new Error("BlobAppendSession: write after finish()");
+    if (chunk.byteLength === 0) return;
+    try {
+      writeSync(this.fd, chunk, 0, chunk.byteLength, this.startOffset + this.written);
+    } catch (err) {
+      try { ftruncateSync(this.fd, this.startOffset + this.written); } catch {}
+      this.blob._commitAppend(this.startOffset + this.written);
+      this.finished = true;
+      throw err;
+    }
+    this.hash.update(chunk);
+    this.written += chunk.byteLength;
+    this.blob._commitAppend(this.startOffset + this.written);
+  }
+
+  finish(): { offset: number; length: number; etag: string } {
+    if (this.finished) throw new Error("BlobAppendSession: already finished");
+    this.finished = true;
+    if (this.syncMode === "full") fsyncSync(this.fd);
+    return {
+      offset: this.startOffset,
+      length: this.written,
+      etag: `"${this.hash.digest("hex")}"`,
+    };
   }
 }

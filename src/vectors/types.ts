@@ -136,6 +136,8 @@ export interface VectorClientOptions {
   storage?: "memory" | "disk";
   /** Number of vectors to keep in the LRU cache when using disk storage. Default: 10000. */
   diskCacheSize?: number;
+  /** Byte budget for the disk-mode vector LRU cache. When set, evicts by bytes instead of entry count. */
+  diskCacheBytes?: number;
 }
 
 // === HNSW Internal Types ===

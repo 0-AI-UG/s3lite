@@ -2,14 +2,17 @@ import type { DistanceMetric, HNSWNode, ScoredResult, MetadataFilter } from "./t
 import { computeNorm, getDistanceFn } from "./distance";
 import { matchesFilter } from "./filter";
 
-// Internal node — uses numeric IDs for neighbors instead of string Sets
+// Internal node — typed-array neighbor slabs to keep per-node RAM low.
+// `neighbors[lc]` is preallocated to maxConn(lc) (M0 for layer 0, M elsewhere);
+// `counts[lc]` is the actual number of populated entries.
 interface INode {
   key: string;
   vector: Float32Array | null; // null when disk-backed (vectors stored externally)
   norm: number;
   metadata?: Record<string, unknown>;
   layer: number;
-  neighbors: number[][]; // neighbors[layerIdx] = array of neighbor node IDs
+  neighbors: Int32Array[];
+  counts: Uint16Array;
 }
 
 // Min-heap with typed array storage — no branches, no object allocation
@@ -217,6 +220,47 @@ export class HNSWIndex {
     }
   }
 
+  private maxConnAt(lc: number): number {
+    return lc === 0 ? this.M0 : this.M;
+  }
+
+  private buildNeighborSlabs(layer: number): { neighbors: Int32Array[]; counts: Uint16Array } {
+    const layers = layer + 1;
+    const neighbors: Int32Array[] = new Array(layers);
+    for (let lc = 0; lc < layers; lc++) {
+      neighbors[lc] = new Int32Array(this.maxConnAt(lc));
+    }
+    return { neighbors, counts: new Uint16Array(layers) };
+  }
+
+  private pushNbr(node: INode, lc: number, id: number): void {
+    const count = node.counts[lc]!;
+    const slab = node.neighbors[lc]!;
+    if (count < slab.length) {
+      slab[count] = id;
+      node.counts[lc] = count + 1;
+    } else {
+      // Should not happen in practice (capacity = maxConn), but guard anyway.
+      const grown = new Int32Array(slab.length * 2);
+      grown.set(slab);
+      grown[count] = id;
+      node.neighbors[lc] = grown;
+      node.counts[lc] = count + 1;
+    }
+  }
+
+  private removeNbr(node: INode, lc: number, id: number): void {
+    const slab = node.neighbors[lc]!;
+    const count = node.counts[lc]!;
+    for (let i = 0; i < count; i++) {
+      if (slab[i] === id) {
+        slab[i] = slab[count - 1]!;
+        node.counts[lc] = count - 1;
+        return;
+      }
+    }
+  }
+
   private randomLayer(): number {
     const r = Math.random() || Number.MIN_VALUE;
     const raw = Math.floor(-Math.log(r) * this.mL);
@@ -236,10 +280,24 @@ export class HNSWIndex {
     return {
       key: n.key, vector: n.vector ?? this.getVec(id), norm: n.norm, metadata: n.metadata,
       layer: n.layer, deleted: false,
-      neighbors: n.neighbors.map(layer =>
-        new Set(layer.filter(nId => this.nodes[nId] !== undefined).map(nId => this.nodes[nId]!.key)),
-      ),
+      neighbors: this.neighborKeySets(n),
     };
+  }
+
+  private neighborKeySets(n: INode): Set<string>[] {
+    const layers = n.neighbors.length;
+    const out: Set<string>[] = new Array(layers);
+    for (let lc = 0; lc < layers; lc++) {
+      const s = new Set<string>();
+      const slab = n.neighbors[lc]!;
+      const count = n.counts[lc]!;
+      for (let i = 0; i < count; i++) {
+        const nb = this.nodes[slab[i]!];
+        if (nb) s.add(nb.key);
+      }
+      out[lc] = s;
+    }
+    return out;
   }
 
   /** Iterate nodes yielding only metadata (no vector access). Used for disk-mode checkpointing. */
@@ -258,9 +316,7 @@ export class HNSWIndex {
       yield {
         key: n.key, vector: n.vector ?? this.getVec(i), norm: n.norm, metadata: n.metadata,
         layer: n.layer, deleted: false,
-        neighbors: n.neighbors.map(layer =>
-          new Set(layer.filter(nId => this.nodes[nId] !== undefined).map(nId => this.nodes[nId]!.key)),
-        ),
+        neighbors: this.neighborKeySets(n),
       };
     }
   }
@@ -277,9 +333,11 @@ export class HNSWIndex {
     const norm = computeNorm(vector);
     const layer = this.randomLayer();
     const id = this.allocId();
+    const slabs = this.buildNeighborSlabs(layer);
     const node: INode = {
       key, vector, norm, metadata, layer,
-      neighbors: Array.from({ length: layer + 1 }, () => []),
+      neighbors: slabs.neighbors,
+      counts: slabs.counts,
     };
 
     this.nodes[id] = node;
@@ -307,7 +365,8 @@ export class HNSWIndex {
         const cn = nodesArr[currentId]!;
         if (lc < cn.neighbors.length) {
           const nbrs = cn.neighbors[lc]!;
-          for (let ni = 0, nLen = nbrs.length; ni < nLen; ni++) {
+          const nLen = cn.counts[lc]!;
+          for (let ni = 0; ni < nLen; ni++) {
             const nbrId = nbrs[ni]!;
             const nbrNode = nodesArr[nbrId];
             if (!nbrNode) continue;
@@ -349,7 +408,8 @@ export class HNSWIndex {
         if (!cNode || lc >= cNode.neighbors.length) continue;
 
         const nbrs = cNode.neighbors[lc]!;
-        for (let ni = 0, nLen = nbrs.length; ni < nLen; ni++) {
+        const nLen = cNode.counts[lc]!;
+        for (let ni = 0; ni < nLen; ni++) {
           const nbrId = nbrs[ni]!;
           if (visited[nbrId] === gen) continue;
           visited[nbrId] = gen;
@@ -384,14 +444,13 @@ export class HNSWIndex {
       const selectedIds = this.selectNeighborIds(vector, norm, rIds, rScores, numResults, maxConn);
 
       // Connect bidirectionally
-      const nodeNbrs = node.neighbors[lc]!;
       for (let si = 0, sLen = selectedIds.length; si < sLen; si++) {
         const nId = selectedIds[si]!;
-        nodeNbrs.push(nId);
+        this.pushNbr(node, lc, nId);
         const nNode = nodesArr[nId]!;
         if (lc < nNode.neighbors.length) {
-          nNode.neighbors[lc]!.push(id);
-          if (nNode.neighbors[lc]!.length > maxConn) {
+          this.pushNbr(nNode, lc, id);
+          if (nNode.counts[lc]! > maxConn) {
             this.pruneConnections(nNode, lc, maxConn);
           }
         }
@@ -470,12 +529,12 @@ export class HNSWIndex {
 
   private pruneConnections(node: INode, layer: number, maxConn: number): void {
     const nbrs = node.neighbors[layer]!;
-    if (nbrs.length <= maxConn) return;
+    const len = node.counts[layer]!;
+    if (len <= maxConn) return;
 
     const distFn = this.distFn;
     const nodesArr = this.nodes;
     const getVec = this.getVec;
-    const len = nbrs.length;
     const nodeId = this.keyToId.get(node.key)!;
     const nodeVec = getVec(nodeId);
 
@@ -487,16 +546,17 @@ export class HNSWIndex {
       scores[i] = nNode ? distFn(nodeVec, getVec(nbrId), node.norm, nNode.norm) : Infinity;
     }
 
-    // Index sort by score ascending
     const indices: number[] = new Array(len);
     for (let i = 0; i < len; i++) indices[i] = i;
     indices.sort((a, b) => scores[a]! - scores[b]!);
 
-    const newNbrs: number[] = new Array(maxConn);
-    for (let i = 0; i < maxConn; i++) {
-      newNbrs[i] = nbrs[indices[i]!]!;
-    }
-    node.neighbors[layer] = newNbrs;
+    // Rewrite slab in place; capacity stays at maxConnAt(layer).
+    const kept = new Int32Array(maxConn);
+    for (let i = 0; i < maxConn; i++) kept[i] = nbrs[indices[i]!]!;
+    nbrs.set(kept);
+    // Zero the tail so stale entries can't be read.
+    for (let i = maxConn; i < nbrs.length; i++) nbrs[i] = 0;
+    node.counts[layer] = maxConn;
   }
 
   remove(key: string): boolean {
@@ -507,16 +567,12 @@ export class HNSWIndex {
 
     for (let lc = 0; lc < node.neighbors.length; lc++) {
       const nbrs = node.neighbors[lc]!;
-      for (let i = 0, len = nbrs.length; i < len; i++) {
+      const len = node.counts[lc]!;
+      for (let i = 0; i < len; i++) {
         const nId = nbrs[i]!;
         const nNode = this.nodes[nId];
         if (nNode && lc < nNode.neighbors.length) {
-          const nNbrs = nNode.neighbors[lc]!;
-          const idx = nNbrs.indexOf(id);
-          if (idx !== -1) {
-            nNbrs[idx] = nNbrs[nNbrs.length - 1]!;
-            nNbrs.pop();
-          }
+          this.removeNbr(nNode, lc, id);
         }
       }
     }
@@ -567,7 +623,8 @@ export class HNSWIndex {
         const cn = nodesArr[currentId]!;
         if (lc < cn.neighbors.length) {
           const nbrs = cn.neighbors[lc]!;
-          for (let ni = 0, nLen = nbrs.length; ni < nLen; ni++) {
+          const nLen = cn.counts[lc]!;
+          for (let ni = 0; ni < nLen; ni++) {
             const nbrId = nbrs[ni]!;
             const nbrNode = nodesArr[nbrId];
             if (!nbrNode) continue;
@@ -608,7 +665,8 @@ export class HNSWIndex {
       if (!cNode || cNode.neighbors.length === 0) continue;
 
       const nbrs = cNode.neighbors[0]!;
-      for (let ni = 0, nLen = nbrs.length; ni < nLen; ni++) {
+      const nLen = cNode.counts[0]!;
+      for (let ni = 0; ni < nLen; ni++) {
         const nbrId = nbrs[ni]!;
         if (visited[nbrId] === gen) continue;
         visited[nbrId] = gen;
@@ -688,16 +746,17 @@ export class HNSWIndex {
 
       for (let lc = 0; lc < node.neighbors.length; lc++) {
         const nbrs = node.neighbors[lc]!;
+        const len = node.counts[lc]!;
         // Count valid neighbors first
         let validCount = 0;
-        for (let ni = 0; ni < nbrs.length; ni++) {
+        for (let ni = 0; ni < len; ni++) {
           if (this.nodes[nbrs[ni]!]) validCount++;
         }
         const nCountBuf = new Uint8Array(2);
         new DataView(nCountBuf.buffer).setUint16(0, validCount, true);
         parts.push(nCountBuf);
 
-        for (let ni = 0; ni < nbrs.length; ni++) {
+        for (let ni = 0; ni < len; ni++) {
           const nNode = this.nodes[nbrs[ni]!];
           if (!nNode) continue;
           const nKeyBytes = encoder.encode(nNode.key);
@@ -767,13 +826,15 @@ export class HNSWIndex {
       const nodeData = nodesMap.get(key);
       if (nodeData) {
         const id = index.allocId();
+        const slabs = index.buildNeighborSlabs(layerCount - 1);
         index.nodes[id] = {
           key,
           vector: nodeData.vector,
           norm: nodeData.norm,
           metadata: nodeData.metadata,
           layer: layerCount - 1,
-          neighbors: Array.from({ length: layerCount }, () => []),
+          neighbors: slabs.neighbors,
+          counts: slabs.counts,
         };
         index.keyToId.set(key, id);
         index.activeCount++;
@@ -791,12 +852,15 @@ export class HNSWIndex {
       const nbrKeys = tempNbrKeys[ni]!;
       for (let lc = 0; lc < nbrKeys.length; lc++) {
         const layerKeys = nbrKeys[lc]!;
-        const nbrs: number[] = [];
+        const slab = node.neighbors[lc]!;
+        let count = 0;
         for (let k = 0; k < layerKeys.length; k++) {
           const nId = index.keyToId.get(layerKeys[k]!);
-          if (nId !== undefined) nbrs.push(nId);
+          if (nId !== undefined && count < slab.length) {
+            slab[count++] = nId;
+          }
         }
-        node.neighbors[lc] = nbrs;
+        node.counts[lc] = count;
       }
     }
 

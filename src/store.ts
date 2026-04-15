@@ -9,7 +9,7 @@ import {
   type S3EventCallback,
 } from "./types";
 import { WAL, type IntegrityReport } from "./wal";
-import { BlobLog } from "./blob";
+import { BlobLog, type BlobAppendSession } from "./blob";
 import { FileLock } from "./lock";
 import { DiskIndex } from "./disk-index";
 import { computeETag, guessMimeType } from "./utils";
@@ -129,6 +129,73 @@ export class Store {
     for (const key of keys) {
       yield [key, bucketMap.get(key)!];
     }
+  }
+
+  /** Whether this store can accept streaming writes (i.e. has a blob log). */
+  get supportsStreaming(): boolean {
+    return this.blobLog !== null;
+  }
+
+  /**
+   * Begin a synchronous chunked write. Returned handle exposes a `write(chunk)`
+   * method that flushes to disk immediately and a `finish(...)` method that
+   * commits the WAL/index entry. Requires a file-backed store.
+   */
+  beginPutSync(bucket: string, key: string): StorePutSession {
+    if (this.readOnly) throw new ReadonlyError("put");
+    if (!this.blobLog) throw new Error("beginPutSync requires blob storage (file-backed store)");
+    return new StorePutSession(this, this.blobLog, bucket, key);
+  }
+
+  /** @internal */
+  _finishPutSync(
+    bucket: string,
+    key: string,
+    offset: number,
+    length: number,
+    etag: string,
+    contentType?: string,
+    contentDisposition?: string,
+    expires?: number,
+  ): { size: number; etag: string } {
+    const resolvedType = contentType ?? guessMimeType(key);
+    const lastModified = new Date();
+    const expiresAt = expires ? Date.now() + expires * 1000 : undefined;
+
+    const existing = this.indexGet(bucket, key);
+    if (existing?.blobLength) this.blobLog!.markDead(existing.blobLength);
+
+    const metadata: Record<string, unknown> = {
+      contentType: resolvedType,
+      etag,
+      lastModified: lastModified.toISOString(),
+      blobOffset: offset,
+      blobLength: length,
+    };
+    if (contentDisposition) metadata.contentDisposition = contentDisposition;
+    if (expiresAt) metadata.expiresAt = expiresAt;
+
+    this.wal!.appendPut(bucket, key, null, metadata);
+    this.indexSet(bucket, key, {
+      data: null, size: length, etag, contentType: resolvedType,
+      lastModified, contentDisposition, expiresAt, blobOffset: offset, blobLength: length,
+    });
+
+    if (!this.inTransaction) {
+      if (this.blobLog!.shouldCompact()) {
+        this.compactAndCheckpoint();
+      } else if (this.wal!.shouldCheckpoint() || (this.diskIdx && this.diskIdx.shouldCompactOverlay())) {
+        if (this.diskIdx) {
+          this.wal!.checkpointFromIterator(this.diskIdx.entries(), true);
+          this.diskIdx.reopen();
+        } else {
+          this.wal!.incrementalCheckpoint();
+        }
+      }
+    }
+
+    this.emit("put", bucket, key);
+    return { size: length, etag };
   }
 
   on(event: S3EventType, callback: S3EventCallback): void {
@@ -694,5 +761,41 @@ export class Store {
       this.lock.release();
       this.lock = null;
     }
+  }
+}
+
+/**
+ * Streaming put session returned from `Store.beginPutSync`. Each `write()`
+ * synchronously writes the chunk to the blob file; `end(opts)` commits the
+ * WAL/index entry. No internal chunk buffering.
+ */
+export class StorePutSession {
+  private store: Store;
+  private session: BlobAppendSession;
+  private bucket: string;
+  private key: string;
+  private finished = false;
+
+  constructor(store: Store, blobLog: BlobLog, bucket: string, key: string) {
+    this.store = store;
+    this.bucket = bucket;
+    this.key = key;
+    this.session = blobLog.beginAppendSync();
+  }
+
+  write(chunk: Uint8Array): number {
+    if (this.finished) throw new Error("StorePutSession: write after end()");
+    this.session.write(chunk);
+    return chunk.byteLength;
+  }
+
+  end(opts?: { contentType?: string; contentDisposition?: string; expires?: number }): { size: number; etag: string } {
+    if (this.finished) throw new Error("StorePutSession: already ended");
+    this.finished = true;
+    const { offset, length, etag } = this.session.finish();
+    return this.store._finishPutSync(
+      this.bucket, this.key, offset, length, etag,
+      opts?.contentType, opts?.contentDisposition, opts?.expires,
+    );
   }
 }
