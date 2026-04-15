@@ -67,12 +67,12 @@ export class Store {
   private pendingEvents: Array<[S3EventType, string, string]> = [];
   private readOnly: boolean;
 
-  constructor(path?: string, syncMode: SyncMode = "normal", indexMode: IndexMode = "memory", readOnly = false) {
+  constructor(path?: string, syncMode: SyncMode = "normal", indexMode: IndexMode = "memory", readOnly = false, lockStaleAfterMs?: number) {
     this.readOnly = readOnly;
     if (path) {
       this.mainPath = path;
       if (!readOnly) {
-        this.lock = new FileLock(path);
+        this.lock = new FileLock(path, { staleAfterMs: lockStaleAfterMs });
         this.lock.acquire();
       }
       this.wal = new WAL(path, syncMode, undefined, readOnly);

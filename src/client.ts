@@ -18,7 +18,7 @@ export class S3Client {
   constructor(options?: S3Options) {
     this.opts = options ?? {};
     this.defaultBucket = options?.bucket ?? "default";
-    this.store = new Store(options?.path, options?.syncMode, options?.indexMode, options?.readonly);
+    this.store = new Store(options?.path, options?.syncMode, options?.indexMode, options?.readonly, options?.lockStaleAfterMs);
   }
 
   file(path: string, options?: S3Options): S3File {

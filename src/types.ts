@@ -44,6 +44,8 @@ export interface S3Options {
   indexMode?: "memory" | "disk";
   /** Open in read-only mode. No file lock is acquired and all write operations throw. Multiple readers can coexist with a writer. */
   readonly?: boolean;
+  /** If set, a lock file older than this many ms is considered stale regardless of PID identity. Useful as an escape hatch after hard crashes in containers where PIDs may be reused. */
+  lockStaleAfterMs?: number;
 }
 
 export interface S3FilePresignOptions extends S3Options {
